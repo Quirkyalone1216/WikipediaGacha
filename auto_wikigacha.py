@@ -6,7 +6,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from playwright.sync_api import (
     BrowserContext,
@@ -18,6 +18,9 @@ from playwright.sync_api import (
 wikiGachaUrl = "https://wikigacha.com/?lang=ZH_HANT"
 returnToPackPageButtonXPath = "/html/body/main/div/div/div[4]/div[1]/button"
 remainingPackCountXPath = "/html/body/main/div/div/div[1]/div[1]/span"
+insufficientPackHeadingXPath = "/html/body/main/div/div/div[1]/div/h2"
+recoverPackButtonXPath = "/html/body/main/div/div/div[1]/div/button"
+adRewardConfirmButtonXPath = "/html/body/main/div/div/div[2]/div/div/div[2]/button"
 
 
 class WikiGachaAutomationError(RuntimeError):
@@ -111,6 +114,30 @@ def parseArguments() -> argparse.Namespace:
             "The default targets the current Traditional Chinese layout's 今日卡包 counter."
         ),
     )
+    parser.add_argument(
+        "--insufficientPackHeadingXPath",
+        default=insufficientPackHeadingXPath,
+        help=(
+            "XPath for the heading that indicates the card-pack shortage state. "
+            "The resolver also uses semantic fallback detection when this XPath is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--recoverPackButtonXPath",
+        default=recoverPackButtonXPath,
+        help=(
+            "XPath for the shortage-state button that starts ad-based pack recovery. "
+            "The resolver also uses semantic fallback detection when this XPath is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--adRewardConfirmButtonXPath",
+        default=adRewardConfirmButtonXPath,
+        help=(
+            "XPath for the post-ad reward confirmation button. "
+            "The resolver waits adaptively for this control and falls back to semantic dialog buttons."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -161,6 +188,77 @@ def getPageFingerprint(page: Page) -> str:
         """
     )
 
+
+def getRenderedStateFingerprint(page: Page) -> str:
+    return page.evaluate(
+        r"""
+        () => {
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const isRenderedElement = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0;
+            };
+            const summarizeElement = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return {
+                    tagName: element.tagName.toLowerCase(),
+                    id: element.id || '',
+                    className: typeof element.className === 'string' ? element.className : '',
+                    role: element.getAttribute('role') || '',
+                    ariaHidden: element.getAttribute('aria-hidden') || '',
+                    text: normalizeWhitespace(element.innerText || element.textContent || ''),
+                    rect: {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                    display: style.display,
+                    visibility: style.visibility,
+                    opacity: style.opacity,
+                    transform: style.transform,
+                    pointerEvents: style.pointerEvents,
+                    zIndex: style.zIndex,
+                };
+            };
+
+            return JSON.stringify({
+                href: location.href,
+                title: document.title,
+                scrollX: window.scrollX,
+                scrollY: window.scrollY,
+                viewportWidth: window.innerWidth,
+                viewportHeight: window.innerHeight,
+                renderedElements: Array.from(document.querySelectorAll('body *'))
+                    .filter(isRenderedElement)
+                    .map(summarizeElement),
+            });
+        }
+        """
+    )
+
+
+def getPageStateFingerprint(page: Page) -> str:
+    return json.dumps(
+        {
+            "pageFingerprint": getPageFingerprint(page),
+            "renderedStateFingerprint": getRenderedStateFingerprint(page),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
 def waitForPageReady(page: Page) -> None:
     page.wait_for_load_state("domcontentloaded", timeout=0)
     page.wait_for_function(
@@ -178,6 +276,7 @@ def waitForRenderCycle(page: Page) -> dict[str, Any]:
         () => new Promise((resolve) => {
             let mutationCount = 0;
             let observedFiniteAnimationCount = 0;
+            let completedFiniteAnimationCount = 0;
             const observer = new MutationObserver((mutations) => {
                 mutationCount += mutations.length;
             });
@@ -190,12 +289,10 @@ def waitForRenderCycle(page: Page) -> dict[str, Any]:
                 });
             }
 
-            const requestSettledCallback = (callback) => {
-                if (typeof window.requestIdleCallback === 'function') {
-                    window.requestIdleCallback(callback);
-                    return;
-                }
-                window.requestAnimationFrame(callback);
+            const requestPostPaintCallback = (callback) => {
+                window.requestAnimationFrame(() => {
+                    window.requestAnimationFrame(callback);
+                });
             };
 
             const getFiniteRunningAnimations = () => document
@@ -209,26 +306,30 @@ def waitForRenderCycle(page: Page) -> dict[str, Any]:
                         && (animation.playState === 'pending' || animation.playState === 'running');
                 });
 
-            const settle = () => {
-                const activeAnimations = getFiniteRunningAnimations();
-                if (activeAnimations.length === 0) {
-                    requestSettledCallback(() => {
-                        observer.disconnect();
-                        resolve({
-                            mutationCount,
-                            observedFiniteAnimationCount,
-                            settledBy: typeof window.requestIdleCallback === 'function'
-                                ? 'requestIdleCallback'
-                                : 'requestAnimationFrame',
-                        });
+            const finish = () => {
+                requestPostPaintCallback(() => {
+                    observer.disconnect();
+                    resolve({
+                        mutationCount,
+                        observedFiniteAnimationCount,
+                        completedFiniteAnimationCount,
+                        settledBy: 'finiteAnimations+postPaint',
                     });
-                    return;
-                }
-                observedFiniteAnimationCount += activeAnimations.length;
-                Promise.allSettled(activeAnimations.map((animation) => animation.finished)).then(settle);
+                });
             };
 
-            settle();
+            const activeAnimations = getFiniteRunningAnimations();
+            if (activeAnimations.length === 0) {
+                finish();
+                return;
+            }
+
+            observedFiniteAnimationCount += activeAnimations.length;
+            Promise.allSettled(activeAnimations.map((animation) => animation.finished))
+                .then((results) => {
+                    completedFiniteAnimationCount += results.length;
+                    finish();
+                });
         })
         """
     )
@@ -259,13 +360,22 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 /(^|[\s　])(?:确定|确认|关闭|知道了|我知道了|同意|继续|进入|开始)(?=$|[\s　])/iu,
                 /(^|[\s　])(?:閉じる|確認|同意|開始|続ける|入る|了解)(?=$|[\s　])/iu,
             ];
+            const primaryDismissPatterns = [
+                /^(知道了|我知道了|確定|確認|關閉|OK)$/iu,
+                /^(知道了|我知道了|确定|确认|关闭|OK)$/iu,
+                /^(got it|ok|okay|close|dismiss|continue)$/iu,
+                /^(了解|閉じる|確認|OK)$/iu,
+            ];
             const rootEvidencePatterns = [
                 /更新通知|公告|通知|入口|歡迎|欢迎|說明|说明/iu,
+                /紀念活動|纪念活动|活動進行中|活动进行中|活動.*進行|活动.*进行/iu,
+                /慶祝|庆祝|累計開啟|累计开启|特別卡包|特别卡包|登入章|登錄章|登录章/iu,
                 /notice|announcement|update|welcome|entry|modal|dialog/iu,
-                /お知らせ|更新|通知|案内/iu,
+                /commemorative|campaign|event\s*(?:ongoing|notice|reward)|special\s*pack/iu,
+                /お知らせ|更新|通知|案内|記念|イベント/iu,
             ];
             const negativePatterns = [
-                /activity|campaign|event|details/iu,
+                /activity\s*details|event\s*details|campaign\s*details/iu,
                 /活動詳情|活动详情|活動詳細|イベント詳細/iu,
                 /server|sync|cloud|beta/iu,
                 /伺服器同步|服务器同步|サーバー同期/iu,
@@ -276,7 +386,9 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
             ];
             const negativeInteractivePatterns = [
                 /@harusugi5|x\.com|twitter\.com/iu,
-                /activity|campaign|event|details/iu,
+                /share|sharing|tweet|post/iu,
+                /分享|轉發|转发|シェア/iu,
+                /activity\s*details|event\s*details|campaign\s*details/iu,
                 /活動詳情|活动详情|活動詳細|イベント詳細/iu,
                 /server|sync|cloud|beta/iu,
                 /伺服器同步|服务器同步|サーバー同期/iu,
@@ -286,11 +398,14 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 /圖鑑|图鉴|對戰|对战|獎盃|奖杯/iu,
             ];
             const positiveDontShowPatterns = [
-                /下次不再顯示|下次不再显示|don't show again|do not show again|次回から表示しない/iu
+                /到明天前不再顯示|到明天前不再显示/iu,
+                /明天.*不再顯示|明天.*不再显示/iu,
+                /下次不再顯示|下次不再显示|不再顯示|不再显示/iu,
+                /don't show again|do not show again|hide until tomorrow/iu,
+                /次回から表示しない|明日まで表示しない/iu
             ];
 
             const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
-
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
             const getDisplayText = (element) => {
@@ -342,6 +457,14 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 return Boolean(hitElement && (element === hitElement || element.contains(hitElement)));
             };
 
+            const getEvidenceCount = (patterns, text) => patterns
+                .map((pattern) => pattern.test(text))
+                .filter(Boolean).length;
+
+            const countVisibleActions = (root) => Array.from(root.querySelectorAll(clickableSelector))
+                .filter(isVisible)
+                .filter((element) => !element.matches('input[type="checkbox"], [role="checkbox"]'));
+
             const isLayerElement = (element) => {
                 if (!(element instanceof HTMLElement)) {
                     return false;
@@ -350,7 +473,7 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 const role = element.getAttribute('role') || '';
                 const classText = getClassText(element);
                 const rect = element.getBoundingClientRect();
-                const classIndicatesGateLayer = /(^|\s)(fixed|modal|dialog|overlay)(\s|$)/iu.test(classText);
+                const classIndicatesGateLayer = /(^|\s)(fixed|modal|dialog|overlay|popover|inset-0|z-\d+)(\s|$)/iu.test(classText);
                 const coversViewport = rect.left <= 0
                     && rect.top <= 0
                     && rect.right >= window.innerWidth
@@ -395,16 +518,30 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 return layerRoot;
             };
 
-            const countVisibleActions = (root) => Array.from(root.querySelectorAll(clickableSelector))
-                .filter(isVisible)
-                .filter((element) => !element.matches('input[type="checkbox"], [role="checkbox"]'));
+            const findSemanticGateRoot = (element) => {
+                let current = element;
+                let semanticRoot = null;
+                while (current && current instanceof HTMLElement && current !== document.body) {
+                    const text = getDisplayText(current);
+                    const visibleActionCount = countVisibleActions(current).length;
+                    const rootEvidence = getEvidenceCount(rootEvidencePatterns, text);
+                    const confirmationActionExists = countVisibleActions(current).some((action) => {
+                        const actionText = getDisplayText(action);
+                        return getEvidenceCount(confirmationPatterns, actionText) > 0
+                            || getEvidenceCount(confirmationTokenPatterns, actionText) > 0;
+                    });
+                    if (rootEvidence > 0 && visibleActionCount > 0 && confirmationActionExists) {
+                        semanticRoot = current;
+                    }
+                    current = current.parentElement;
+                }
+                return semanticRoot;
+            };
 
-            const getEvidenceCount = (patterns, text) => patterns
-                .map((pattern) => pattern.test(text))
-                .filter(Boolean).length;
+            const findGateRoot = (element) => findSemanticGateRoot(element) || findLayerRoot(element);
 
             const findDontShowControl = (element) => {
-                const searchRoot = findLayerRoot(element) || document.body;
+                const searchRoot = findGateRoot(element) || document.body;
                 const controls = Array.from(searchRoot.querySelectorAll('label, input[type="checkbox"], [role="checkbox"]'));
                 for (const control of controls) {
                     const text = getDisplayText(control.parentElement || control);
@@ -412,15 +549,22 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                         const checkbox = control.matches('input[type="checkbox"], [role="checkbox"]')
                             ? control
                             : control.querySelector('input[type="checkbox"], [role="checkbox"]');
-                        if (checkbox instanceof HTMLElement && isVisible(checkbox)) {
+                        const clickTarget = checkbox instanceof HTMLElement && isVisible(checkbox)
+                            ? checkbox
+                            : control instanceof HTMLElement && isVisible(control)
+                                ? control
+                                : null;
+                        if (clickTarget) {
                             const marker = `${markerPrefix}-dont-show`;
-                            checkbox.setAttribute('data-auto-wikigacha-entry', marker);
+                            clickTarget.setAttribute('data-auto-wikigacha-entry', marker);
                             return {
                                 selector: `[data-auto-wikigacha-entry="${marker}"]`,
                                 text: text.slice(0, 220),
                                 checked: checkbox instanceof HTMLInputElement
                                     ? checkbox.checked
-                                    : checkbox.getAttribute('aria-checked') === 'true'
+                                    : checkbox instanceof HTMLElement
+                                        ? checkbox.getAttribute('aria-checked') === 'true'
+                                        : false
                             };
                         }
                     }
@@ -433,16 +577,17 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 .map((element, index) => {
                     const displayText = getDisplayText(element);
                     const normalizedText = getNormalizedText(element);
-                    const layerRoot = findLayerRoot(element);
-                    const layerText = getDisplayText(layerRoot);
+                    const gateRoot = findGateRoot(element);
                     const layerChain = collectLayerChain(element);
-                    const visibleActionsInLayer = layerRoot ? countVisibleActions(layerRoot) : [];
+                    const gateText = getDisplayText(gateRoot);
+                    const visibleActionsInGate = gateRoot ? countVisibleActions(gateRoot) : [];
                     const exactConfirmationEvidence = getEvidenceCount(confirmationPatterns, displayText);
                     const tokenConfirmationEvidence = getEvidenceCount(confirmationTokenPatterns, displayText)
                         + getEvidenceCount(confirmationTokenPatterns, normalizedText);
-                    const confirmationEvidence = exactConfirmationEvidence + tokenConfirmationEvidence;
-                    const rootEvidence = getEvidenceCount(rootEvidencePatterns, layerText);
-                    const fallbackEvidence = layerRoot
+                    const primaryDismissEvidence = getEvidenceCount(primaryDismissPatterns, displayText);
+                    const confirmationEvidence = exactConfirmationEvidence + tokenConfirmationEvidence + primaryDismissEvidence;
+                    const rootEvidence = getEvidenceCount(rootEvidencePatterns, gateText);
+                    const fallbackEvidence = gateRoot
                         && rootEvidence > 0
                         && element.tagName.toLowerCase() === 'button'
                         && getEvidenceCount(negativeInteractivePatterns, displayText) === 0
@@ -460,16 +605,19 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                         tagName: element.tagName.toLowerCase(),
                         role: element.getAttribute('role') || '',
                         href: element.getAttribute('href') || '',
+                        exactConfirmationEvidence,
+                        tokenConfirmationEvidence,
+                        primaryDismissEvidence,
                         confirmationEvidence,
                         rootEvidence,
                         fallbackEvidence,
                         negativeEvidence,
                         negativeInteractiveEvidence,
-                        hasGateLayer: Boolean(layerRoot),
+                        hasGateLayer: Boolean(gateRoot),
                         pointerReceivable: isPointerReceivable(element),
                         layerChain,
-                        layerText: layerText.slice(0, 420),
-                        visibleActionCountInLayer: visibleActionsInLayer.length,
+                        layerText: gateText.slice(0, 420),
+                        visibleActionCountInLayer: visibleActionsInGate.length,
                         area: rect.width * rect.height,
                         top: rect.top,
                         left: rect.left,
@@ -483,7 +631,9 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 .filter((candidate) => candidate.negativeInteractiveEvidence === 0)
                 .sort((left, right) => {
                     const comparisons = [
+                        right.primaryDismissEvidence - left.primaryDismissEvidence,
                         right.rootEvidence - left.rootEvidence,
+                        right.exactConfirmationEvidence - left.exactConfirmationEvidence,
                         right.confirmationEvidence - left.confirmationEvidence,
                         right.fallbackEvidence - left.fallbackEvidence,
                         left.negativeEvidence - right.negativeEvidence,
@@ -500,6 +650,9 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 tagName: candidate.tagName,
                 role: candidate.role,
                 href: candidate.href,
+                exactConfirmationEvidence: candidate.exactConfirmationEvidence,
+                tokenConfirmationEvidence: candidate.tokenConfirmationEvidence,
+                primaryDismissEvidence: candidate.primaryDismissEvidence,
                 confirmationEvidence: candidate.confirmationEvidence,
                 rootEvidence: candidate.rootEvidence,
                 fallbackEvidence: candidate.fallbackEvidence,
@@ -518,7 +671,7 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
             const visibleLayerDiagnostics = Array.from(document.querySelectorAll('body *'))
                 .filter((element) => element instanceof HTMLElement)
                 .filter(isVisible)
-                .filter(isLayerElement)
+                .filter((element) => isLayerElement(element) || getEvidenceCount(rootEvidencePatterns, getDisplayText(element)) > 0)
                 .map((element) => {
                     const style = window.getComputedStyle(element);
                     const rect = element.getBoundingClientRect();
@@ -537,7 +690,7 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
             if (candidates.length === 0) {
                 return {
                     ok: false,
-                    reason: 'No top-layer entry/update gate action was detected.',
+                    reason: 'No top-layer entry/update/event gate action was detected.',
                     candidates: allCandidates.map(summarize).slice(0, 32),
                     visibleLayerDiagnostics,
                 };
@@ -609,51 +762,77 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                 '[role="button"]',
                 '[onclick]',
                 '[tabindex]',
-                '[id]',
-                '[class]',
-                'img[alt]'
+                '.cursor-pointer',
+                '[id*="gacha" i]',
+                '[id*="pack" i]',
+                '[class*="gacha" i]',
+                '[class*="pack" i]',
+                '[class*="card-back" i]',
+                '[class*="flip-card" i]',
+                '[class*="reveal" i]'
+            ].join(',');
+            const actionableClosestSelector = [
+                'button',
+                'a[href]',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]',
+                '.cursor-pointer',
+                '[id*="gacha" i]',
+                '[id*="pack" i]',
+                '[class*="gacha" i]',
+                '[class*="pack" i]',
+                '[class*="card-back" i]',
+                '[class*="flip-card" i]',
+                '[class*="reveal" i]'
             ].join(',');
             const positivePatterns = [
                 /gacha/iu,
                 /wiki\s*pack/iu,
                 /pack/iu,
-                /open/iu,
-                /draw/iu,
-                /pull/iu,
-                /card/iu,
-                /reveal/iu,
-                /flip/iu,
-                /ガチャ/iu,
-                /パック/iu,
-                /カード/iu,
-                /開封/iu,
-                /開く/iu,
-                /引く/iu,
-                /回す/iu,
-                /抽/iu,
-                /抽卡/iu,
-                /召喚/iu,
-                /卡/iu,
-                /卡包/iu,
-                /開包/iu,
-                /開啟/iu,
-                /點擊/iu,
-                /點擊開啟/iu,
-                /翻/iu,
-                /揭/iu
+                /open\s*(?:pack|card)/iu,
+                /draw|pull/iu,
+                /reveal|flip/iu,
+                /ガチャ|パック|開封|開く|引く|回す/iu,
+                /抽卡|抽|召喚|卡包|開包|開啟|點擊開啟|點擊.*(?:開|翻|揭)/iu,
+                /点击开启|点击.*(?:开|翻|揭)/iu
             ];
             const highConfidencePatterns = [
                 /gacha-pack-container/iu,
-                /wiki\s*pack/iu,
-                /點擊開啟|点击开启/iu,
-                /今日卡包/iu,
-                /card[-_\s]*(back|front|container|item)|flip[-_\s]*card|reveal/iu,
-                /pack[-_\s]*(opening|result|container)/iu
+                /pack[-_\s]*(?:opening|container|target|button)/iu,
+                /card[-_\s]*(?:back|container|unrevealed|hidden|face[-_\s]*down)/iu,
+                /flip[-_\s]*card|reveal[-_\s]*(?:card|target)/iu,
+                /unrevealed|face[-_\s]*down|card\s*back/iu,
+                /點擊開啟|点击开启|未翻|未開|未开|背面|卡背/iu,
+                /今日卡包/iu
+            ];
+            const returnPatterns = [
+                /返回卡包頁面|返回卡包页面|回到卡包|回卡包/iu,
+                /返回.*卡包|卡包.*返回/iu,
+                /return\s+to\s+pack|back\s+to\s+pack|pack\s+page/iu,
+                /パック.*戻|戻.*パック/iu
+            ];
+            const resultUtilityPatterns = [
+                /複製結果|复制结果|分享結果|分享结果/iu,
+                /copy\s+result|share\s+result/iu,
+                /左右滑動|左右滑动|使用\s*<>\s*翻頁|使用\s*<>\s*翻页/iu,
+                /內容遵循|内容遵循|Wikipedia 作者所有|ATK|DEF/iu,
+                /分享|share|シェア|複製|复制|copy/iu,
+                /結果|结果|result/iu
+            ];
+            const carouselControlPatterns = [
+                /^\s*[<>‹›«»]\s*$/u,
+                /上一張|下一張|上一张|下一张|previous|next/iu,
+                /carousel|slider|swiper|slide/iu,
+                /翻頁|翻页|ページ/iu
             ];
             const negativePatterns = [
+                ...returnPatterns,
+                ...resultUtilityPatterns,
+                ...carouselControlPatterns,
                 /privacy|policy|terms|contact/iu,
                 /wikipedia\.org/iu,
-                /activity|campaign|event|details/iu,
+                /activity\s*details|campaign\s*details|event\s*details/iu,
                 /活動詳情|活动详情|活動詳細|イベント詳細/iu,
                 /server|sync|cloud|beta/iu,
                 /伺服器同步|服务器同步|サーバー同期/iu,
@@ -662,26 +841,29 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                 /battle|對戰|对战|バトル/iu,
                 /trophy|獎盃|奖杯/iu,
                 /help|rule|說明|说明|遊戲說明|游戏说明/iu,
-                /share|分享/iu,
                 /ad|advertisement|廣告|广告/iu,
-                /隱私|隐私|條款|条款|聯絡|联系|お問い合わせ/iu,
-                /返回卡包頁面|返回卡包页面|回到卡包|return\s+to\s+pack|back\s+to\s+pack/iu
+                /隱私|隐私|條款|条款|聯絡|联系|お問い合わせ/iu
             ];
 
             const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-            const getNormalizedText = (element) => normalizeWhitespace([
-                element.innerText,
-                element.textContent,
-                element.getAttribute('aria-label'),
-                element.getAttribute('title'),
-                element.getAttribute('value'),
-                element.id,
-                getClassText(element),
-                element.getAttribute('data-testid'),
-                ...Array.from(element.querySelectorAll('img[alt]')).map((image) => image.getAttribute('alt'))
-            ].filter(Boolean).join(' '));
-
+            const getNormalizedText = (element) => {
+                if (!element) {
+                    return '';
+                }
+                return normalizeWhitespace([
+                    element.innerText,
+                    element.textContent,
+                    element.getAttribute ? element.getAttribute('aria-label') : '',
+                    element.getAttribute ? element.getAttribute('title') : '',
+                    element.getAttribute ? element.getAttribute('value') : '',
+                    element.id,
+                    getClassText(element),
+                    element.getAttribute ? element.getAttribute('data-testid') : '',
+                    ...Array.from(element.querySelectorAll ? element.querySelectorAll('img[alt]') : [])
+                        .map((image) => image.getAttribute('alt'))
+                ].filter(Boolean).join(' '));
+            };
             const isVisible = (element) => {
                 if (!(element instanceof HTMLElement)) {
                     return false;
@@ -695,15 +877,16 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                     && !element.hasAttribute('disabled')
                     && element.getAttribute('aria-disabled') !== 'true';
             };
-
             const isPointerReceivable = (element) => {
-                const rect = element.getBoundingClientRect();
-                const centerX = rect.left + rect.width / 2;
-                const centerY = rect.top + rect.height / 2;
-                const hitElement = document.elementFromPoint(centerX, centerY);
-                return Boolean(hitElement && (element === hitElement || element.contains(hitElement)));
+                const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+                const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
+                return targetRectangles.some((rect) => {
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    const hitElement = document.elementFromPoint(centerX, centerY);
+                    return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
+                });
             };
-
             const isInteractive = (element) => {
                 const style = window.getComputedStyle(element);
                 const tagName = element.tagName.toLowerCase();
@@ -716,11 +899,9 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                     || style.cursor === 'pointer'
                     || /(^|\s)cursor-pointer(\s|$)/u.test(classText);
             };
-
             const getEvidenceCount = (patterns, text) => patterns
                 .map((pattern) => pattern.test(text))
                 .filter(Boolean).length;
-
             const resolveXPathElement = (xpath) => {
                 if (!xpath) {
                     return null;
@@ -741,11 +922,15 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
             const configuredReturnButton = resolveXPathElement(returnButtonXPath);
             const isReturnButtonOrInside = (element) => configuredReturnButton
                 && (element === configuredReturnButton || configuredReturnButton.contains(element));
+            const visibleBodyText = document.body ? getNormalizedText(document.body) : '';
+            const pageResultEvidence = getEvidenceCount(returnPatterns, visibleBodyText)
+                + getEvidenceCount(resultUtilityPatterns, visibleBodyText);
 
-            const candidates = Array.from(document.querySelectorAll(candidateSelector))
+            const allCandidates = Array.from(document.querySelectorAll(candidateSelector))
+                .filter((element) => element instanceof HTMLElement)
                 .filter(isVisible)
                 .map((element, index) => {
-                    const actionableElement = element.closest('button, a[href], [role="button"], [onclick], [tabindex], .cursor-pointer, [id*="gacha" i], [id*="pack" i], [class*="card" i]') || element;
+                    const actionableElement = element.closest(actionableClosestSelector) || element;
                     const actionableText = getNormalizedText(actionableElement);
                     const elementText = getNormalizedText(element);
                     const combinedText = normalizeWhitespace(`${actionableText} ${elementText}`);
@@ -754,6 +939,9 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                     const positiveEvidence = getEvidenceCount(positivePatterns, combinedText);
                     const highConfidenceEvidence = getEvidenceCount(highConfidencePatterns, combinedText);
                     const negativeEvidence = getEvidenceCount(negativePatterns, combinedText);
+                    const resultUtilityEvidence = getEvidenceCount(resultUtilityPatterns, combinedText);
+                    const carouselControlEvidence = getEvidenceCount(carouselControlPatterns, combinedText);
+                    const returnEvidence = getEvidenceCount(returnPatterns, combinedText);
                     const marker = `${markerPrefix}-${index}`;
                     return {
                         element: actionableElement,
@@ -763,9 +951,14 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                         role: actionableElement.getAttribute('role') || '',
                         href: actionableElement.getAttribute('href') || '',
                         id: actionableElement.id || '',
+                        className: getClassText(actionableElement).slice(0, 260),
                         positiveEvidence,
                         highConfidenceEvidence,
                         negativeEvidence,
+                        resultUtilityEvidence,
+                        carouselControlEvidence,
+                        returnEvidence,
+                        pageResultEvidence,
                         pointerReceivable: isPointerReceivable(actionableElement),
                         interactive: isInteractive(actionableElement),
                         cursor: style.cursor,
@@ -775,14 +968,20 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                         isConfiguredReturnButton: isReturnButtonOrInside(actionableElement),
                     };
                 })
-                .filter((candidate, index, allCandidates) => {
-                    return index === allCandidates.findIndex((other) => other.element === candidate.element);
-                })
+                .filter((candidate, index, candidates) => {
+                    return index === candidates.findIndex((other) => other.element === candidate.element);
+                });
+
+            const candidates = allCandidates
                 .filter((candidate) => !candidate.isConfiguredReturnButton)
+                .filter((candidate) => candidate.returnEvidence === 0)
+                .filter((candidate) => candidate.resultUtilityEvidence === 0)
+                .filter((candidate) => candidate.carouselControlEvidence === 0)
                 .filter((candidate) => candidate.pointerReceivable)
                 .filter((candidate) => candidate.interactive)
                 .filter((candidate) => candidate.positiveEvidence > 0 || candidate.highConfidenceEvidence > 0)
                 .filter((candidate) => candidate.negativeEvidence === 0 || candidate.highConfidenceEvidence > 0)
+                .filter((candidate) => pageResultEvidence === 0 || candidate.highConfidenceEvidence > 0)
                 .sort((left, right) => {
                     const comparisons = [
                         right.highConfidenceEvidence - left.highConfidenceEvidence,
@@ -801,9 +1000,14 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                 role: candidate.role,
                 href: candidate.href,
                 id: candidate.id,
+                className: candidate.className,
                 positiveEvidence: candidate.positiveEvidence,
                 highConfidenceEvidence: candidate.highConfidenceEvidence,
                 negativeEvidence: candidate.negativeEvidence,
+                resultUtilityEvidence: candidate.resultUtilityEvidence,
+                carouselControlEvidence: candidate.carouselControlEvidence,
+                returnEvidence: candidate.returnEvidence,
+                pageResultEvidence: candidate.pageResultEvidence,
                 pointerReceivable: candidate.pointerReceivable,
                 interactive: candidate.interactive,
                 cursor: candidate.cursor,
@@ -816,8 +1020,11 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
             if (candidates.length === 0) {
                 return {
                     ok: false,
-                    reason: 'No visible, pointer-receivable pack/card continuation target was found.',
-                    candidates: [],
+                    reason: pageResultEvidence > 0
+                        ? 'Result-page controls were detected, so pack/card continuation targets were suppressed to avoid clicking revealed cards or carousel/result utility controls.'
+                        : 'No visible, pointer-receivable pack/card continuation target was found.',
+                    candidates: allCandidates.map(summarize).slice(0, 48),
+                    pageResultEvidence,
                     visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
                 };
             }
@@ -885,15 +1092,33 @@ def saveEvidence(page: Page, evidencePath: Path, label: str, extraPayload: dict[
 
 
 
-def resolveRemainingPackCount(page: Page, remainingCountXPath: str) -> dict[str, Any]:
+def resolveRemainingPackCount(
+    page: Page,
+    remainingCountXPath: str,
+    insufficientPackHeadingXPathValue: str = insufficientPackHeadingXPath,
+) -> dict[str, Any]:
     return page.evaluate(
         r"""
-        (remainingCountXPath) => {
+        ({ remainingCountXPath, insufficientPackHeadingXPathValue }) => {
             const markerPrefix = `auto-wikigacha-count-${Date.now()}-${Math.random().toString(36).slice(2)}`;
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
             const normalizeDigits = (value) => String(value || '').replace(/[０-９]/gu, (digit) => {
                 return String.fromCharCode(digit.charCodeAt(0) - 0xFF10 + 0x30);
             });
+            const insufficientPackPatterns = [
+                /卡包不足/iu,
+                /pack\s*(?:unavailable|insufficient|depleted|empty|not\s+enough)/iu,
+                /(?:unavailable|insufficient|depleted|empty|not\s+enough)\s*pack/iu,
+                /パック.*不足|不足.*パック/iu,
+            ];
+            const progressionCounterPatterns = [
+                /次後獲得/iu,
+                /次后获得/iu,
+                /後獲得/iu,
+                /后获得/iu,
+                /after\s*\d*\s*(?:more\s*)?(?:draws?|pulls?|opens?)/iu,
+                /あと\s*\d*\s*回/iu,
+            ];
             const isVisible = (element) => {
                 if (!(element instanceof HTMLElement)) {
                     return false;
@@ -941,6 +1166,12 @@ def resolveRemainingPackCount(page: Page, remainingCountXPath: str) -> dict[str,
                     normalizedText,
                 };
             };
+            const buildSyntheticCount = (text, remainingPackCount) => ({
+                remainingPackCount,
+                totalPackCapacity: null,
+                parsedNumbers: [],
+                normalizedText: normalizeDigits(text),
+            });
             const summarize = (element, source, parsedCount) => {
                 const rect = element.getBoundingClientRect();
                 return {
@@ -958,11 +1189,43 @@ def resolveRemainingPackCount(page: Page, remainingCountXPath: str) -> dict[str,
                     left: rect.left,
                 };
             };
+            const matchesAnyPattern = (patterns, text) => patterns.some((pattern) => pattern.test(text));
+
+            const configuredInsufficientHeading = resolveXPathElement(insufficientPackHeadingXPathValue);
+            const insufficientHeadingCandidates = [
+                configuredInsufficientHeading,
+                ...Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]')),
+            ]
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isVisible)
+                .filter((element, index, allElements) => index === allElements.findIndex((other) => other === element))
+                .map((element) => ({
+                    element,
+                    text: getElementText(element),
+                    source: element === configuredInsufficientHeading ? 'configuredInsufficientPackHeadingXPath' : 'semanticInsufficientPackHeading',
+                }))
+                .filter((candidate) => matchesAnyPattern(insufficientPackPatterns, candidate.text));
+
+            if (insufficientHeadingCandidates.length > 0) {
+                const selectedCandidate = insufficientHeadingCandidates[0];
+                const marker = `${markerPrefix}-insufficient-pack`;
+                selectedCandidate.element.setAttribute('data-auto-wikigacha-count', marker);
+                const syntheticCount = buildSyntheticCount(selectedCandidate.text, 0);
+                return {
+                    ok: true,
+                    selector: `[data-auto-wikigacha-count="${marker}"]`,
+                    selected: summarize(selectedCandidate.element, selectedCandidate.source, syntheticCount),
+                    candidates: insufficientHeadingCandidates.map((candidate) => {
+                        return summarize(candidate.element, candidate.source, buildSyntheticCount(candidate.text, 0));
+                    }),
+                };
+            }
 
             const configuredElement = resolveXPathElement(remainingCountXPath);
             if (configuredElement instanceof HTMLElement && isVisible(configuredElement)) {
-                const parsedCount = parseCountText(getElementText(configuredElement));
-                if (parsedCount) {
+                const configuredText = getElementText(configuredElement);
+                const parsedCount = parseCountText(configuredText);
+                if (parsedCount && !matchesAnyPattern(progressionCounterPatterns, configuredText)) {
                     const marker = `${markerPrefix}-configured-xpath`;
                     configuredElement.setAttribute('data-auto-wikigacha-count', marker);
                     return {
@@ -977,9 +1240,10 @@ def resolveRemainingPackCount(page: Page, remainingCountXPath: str) -> dict[str,
             const semanticCandidateSelector = ['span', 'div', 'p', '[aria-label]', '[title]'].join(',');
             const packCounterPatterns = [
                 /今日卡包/iu,
-                /卡包/iu,
-                /pack/iu,
-                /パック/iu,
+                /today.*pack/iu,
+                /pack.*(?:remaining|left|count)/iu,
+                /(?:remaining|left|count).*pack/iu,
+                /本日.*パック|今日.*パック/iu,
                 /\//u,
             ];
             const candidates = Array.from(document.querySelectorAll(semanticCandidateSelector))
@@ -992,18 +1256,30 @@ def resolveRemainingPackCount(page: Page, remainingCountXPath: str) -> dict[str,
                         .map((pattern) => pattern.test(text))
                         .filter(Boolean)
                         .length;
+                    const progressionEvidence = progressionCounterPatterns
+                        .map((pattern) => pattern.test(text))
+                        .filter(Boolean)
+                        .length;
+                    const insufficientEvidence = insufficientPackPatterns
+                        .map((pattern) => pattern.test(text))
+                        .filter(Boolean)
+                        .length;
                     const rect = element.getBoundingClientRect();
                     return {
                         element,
                         marker: `${markerPrefix}-semantic-${index}`,
                         parsedCount,
                         evidence,
+                        progressionEvidence,
+                        insufficientEvidence,
                         area: rect.width * rect.height,
                         top: rect.top,
                         left: rect.left,
                     };
                 })
                 .filter((candidate) => candidate.parsedCount && candidate.evidence > 0)
+                .filter((candidate) => candidate.progressionEvidence === 0)
+                .filter((candidate) => candidate.insufficientEvidence === 0)
                 .sort((left, right) => {
                     const comparisons = [
                         right.evidence - left.evidence,
@@ -1021,6 +1297,9 @@ def resolveRemainingPackCount(page: Page, remainingCountXPath: str) -> dict[str,
                     configuredXPath: remainingCountXPath,
                     configuredXPathVisible: configuredElement instanceof HTMLElement ? isVisible(configuredElement) : false,
                     configuredXPathText: configuredElement instanceof HTMLElement ? getElementText(configuredElement).slice(0, 260) : '',
+                    insufficientPackHeadingXPath: insufficientPackHeadingXPathValue,
+                    insufficientPackHeadingVisible: configuredInsufficientHeading instanceof HTMLElement ? isVisible(configuredInsufficientHeading) : false,
+                    insufficientPackHeadingText: configuredInsufficientHeading instanceof HTMLElement ? getElementText(configuredInsufficientHeading).slice(0, 260) : '',
                     visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
                 };
             }
@@ -1035,9 +1314,11 @@ def resolveRemainingPackCount(page: Page, remainingCountXPath: str) -> dict[str,
             };
         }
         """,
-        remainingCountXPath,
+        {
+            "remainingCountXPath": remainingCountXPath,
+            "insufficientPackHeadingXPathValue": insufficientPackHeadingXPathValue,
+        },
     )
-
 
 def getRemainingPackCountValue(remainingPackResolution: dict[str, Any]) -> int | None:
     if not remainingPackResolution.get("ok"):
@@ -1062,17 +1343,35 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                 'a[href]',
                 '[role="button"]',
                 '[onclick]',
-                '[tabindex]'
+                '[tabindex]',
+                '.cursor-pointer'
             ].join(',');
             const returnPatterns = [
                 /返回卡包頁面/iu,
                 /返回卡包页面/iu,
                 /回到卡包/iu,
                 /回卡包/iu,
+                /返回.*卡包/iu,
+                /卡包.*返回/iu,
                 /return\s+to\s+pack/iu,
                 /back\s+to\s+pack/iu,
                 /pack\s+page/iu,
                 /パック.*戻|戻.*パック/iu
+            ];
+            const resultUtilityPatterns = [
+                /複製結果|复制结果|分享結果|分享结果/iu,
+                /copy\s+result|share\s+result/iu,
+                /分享|share|シェア/iu,
+                /複製|复制|copy/iu,
+                /結果|结果|result/iu,
+            ];
+            const navigationNegativePatterns = [
+                /圖鑑|图鉴|図鑑/iu,
+                /對戰|对战|battle|バトル/iu,
+                /獎盃|奖杯|trophy/iu,
+                /遊戲說明|游戏说明|help|rule/iu,
+                /privacy|policy|terms|contact/iu,
+                /隱私|隐私|條款|条款|聯絡|联系|お問い合わせ/iu,
             ];
             const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -1090,6 +1389,449 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                     getClassText(element),
                     ...Array.from(element.querySelectorAll ? element.querySelectorAll('img[alt]') : [])
                         .map((image) => image.getAttribute('alt'))
+                ].filter(Boolean).join(' '));
+            };
+            const isVisible = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && !element.hasAttribute('disabled')
+                    && element.getAttribute('aria-disabled') !== 'true';
+            };
+            const isPointerReceivable = (element) => {
+                const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+                const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
+                return targetRectangles.some((rect) => {
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    const hitElement = document.elementFromPoint(centerX, centerY);
+                    return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
+                });
+            };
+            const isActionable = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const tagName = element.tagName.toLowerCase();
+                return tagName === 'button'
+                    || tagName === 'a'
+                    || element.getAttribute('role') === 'button'
+                    || element.hasAttribute('onclick')
+                    || element.hasAttribute('tabindex')
+                    || style.cursor === 'pointer';
+            };
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(
+                        xpath,
+                        document,
+                        null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE,
+                        null,
+                    ).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
+            const getEvidenceCount = (patterns, text) => patterns
+                .map((pattern) => pattern.test(text))
+                .filter(Boolean)
+                .length;
+            const summarize = (element, source, evidence) => {
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+                return {
+                    text: getNormalizedText(element).slice(0, 260),
+                    tagName: element.tagName.toLowerCase(),
+                    role: element.getAttribute('role') || '',
+                    href: element.getAttribute('href') || '',
+                    id: element.id || '',
+                    className: getClassText(element).slice(0, 260),
+                    source,
+                    returnEvidence: evidence.returnEvidence,
+                    resultUtilityEvidence: evidence.resultUtilityEvidence,
+                    navigationNegativeEvidence: evidence.navigationNegativeEvidence,
+                    pointerReceivable: isPointerReceivable(element),
+                    actionable: isActionable(element),
+                    cursor: style.cursor,
+                    area: rect.width * rect.height,
+                    top: rect.top,
+                    left: rect.left,
+                };
+            };
+            const buildCandidate = (element, marker, source) => {
+                const text = getNormalizedText(element);
+                const evidence = {
+                    returnEvidence: getEvidenceCount(returnPatterns, text),
+                    resultUtilityEvidence: getEvidenceCount(resultUtilityPatterns, text),
+                    navigationNegativeEvidence: getEvidenceCount(navigationNegativePatterns, text),
+                };
+                return {
+                    element,
+                    marker,
+                    source,
+                    text,
+                    ...evidence,
+                    summary: summarize(element, source, evidence),
+                };
+            };
+
+            const configuredElement = resolveXPathElement(returnButtonXPath);
+            const configuredCandidate = configuredElement instanceof HTMLElement
+                ? buildCandidate(configuredElement, `${markerPrefix}-configured-xpath`, 'configuredXPath')
+                : null;
+
+            const semanticCandidates = Array.from(document.querySelectorAll(semanticCandidateSelector))
+                .filter((element) => element instanceof HTMLElement)
+                .map((element, index) => buildCandidate(element, `${markerPrefix}-semantic-${index}`, 'semanticFallback'));
+
+            const candidates = [configuredCandidate, ...semanticCandidates]
+                .filter(Boolean)
+                .filter((candidate, index, allCandidates) => {
+                    return index === allCandidates.findIndex((other) => other.element === candidate.element);
+                })
+                .filter((candidate) => isVisible(candidate.element))
+                .filter((candidate) => candidate.summary.actionable)
+                .filter((candidate) => candidate.returnEvidence > 0)
+                .filter((candidate) => candidate.navigationNegativeEvidence === 0)
+                .sort((left, right) => {
+                    const comparisons = [
+                        right.returnEvidence - left.returnEvidence,
+                        left.resultUtilityEvidence - right.resultUtilityEvidence,
+                        left.navigationNegativeEvidence - right.navigationNegativeEvidence,
+                        Number(right.summary.pointerReceivable) - Number(left.summary.pointerReceivable),
+                        right.summary.area - left.summary.area,
+                        right.summary.top - left.summary.top,
+                        left.summary.left - right.summary.left,
+                    ];
+                    return comparisons.find((comparison) => comparison !== 0) || 0;
+                });
+
+            const rejectedConfiguredElement = configuredCandidate
+                ? configuredCandidate.summary
+                : null;
+
+            if (candidates.length === 0) {
+                return {
+                    ok: false,
+                    reason: 'No visible semantic return-to-pack-page button was found. Configured XPath is not trusted unless its own text matches a return-to-pack action.',
+                    configuredXPath: returnButtonXPath,
+                    configuredXPathResolved: configuredElement instanceof HTMLElement,
+                    rejectedConfiguredElement,
+                    candidates: [configuredCandidate, ...semanticCandidates]
+                        .filter(Boolean)
+                        .map((candidate) => candidate.summary)
+                        .slice(0, 48),
+                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
+                };
+            }
+
+            const selectedCandidate = candidates[0];
+            selectedCandidate.element.setAttribute('data-auto-wikigacha-return', selectedCandidate.marker);
+            return {
+                ok: true,
+                selector: `[data-auto-wikigacha-return="${selectedCandidate.marker}"]`,
+                selected: selectedCandidate.summary,
+                rejectedConfiguredElement,
+                candidates: candidates.map((candidate) => candidate.summary),
+            };
+        }
+        """,
+        returnButtonXPath,
+    )
+
+def buildResolutionFingerprint(resolution: dict[str, Any]) -> str:
+    comparableResolution = {
+        "ok": resolution.get("ok"),
+        "reason": resolution.get("reason"),
+        "selected": resolution.get("selected"),
+    }
+    return buildShortHash(json.dumps(comparableResolution, ensure_ascii=False, sort_keys=True))
+
+
+def clickSelectorUsingFreshDomElement(page: Page, selector: str) -> dict[str, Any]:
+    return page.evaluate(
+        r"""
+        (selector) => new Promise((resolve) => {
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const summarizeElement = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return null;
+                }
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+                return {
+                    tagName: element.tagName.toLowerCase(),
+                    id: element.id || '',
+                    className: typeof element.className === 'string' ? element.className.slice(0, 260) : '',
+                    role: element.getAttribute('role') || '',
+                    text: normalizeWhitespace([
+                        element.innerText,
+                        element.textContent,
+                        element.getAttribute('aria-label'),
+                        element.getAttribute('title'),
+                        element.getAttribute('value'),
+                    ].filter(Boolean).join(' ')).slice(0, 260),
+                    connected: element.isConnected,
+                    rect: {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                    display: style.display,
+                    visibility: style.visibility,
+                    opacity: style.opacity,
+                    pointerEvents: style.pointerEvents,
+                };
+            };
+            const isUsableElement = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return { ok: false, reason: 'selectorDidNotResolveToHTMLElement' };
+                }
+                if (!element.isConnected || !document.documentElement.contains(element)) {
+                    return { ok: false, reason: 'elementIsDetachedFromDom' };
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                if (style.visibility === 'hidden' || style.display === 'none' || rect.width <= 0 || rect.height <= 0) {
+                    return { ok: false, reason: 'elementIsNotRendered' };
+                }
+                if (element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true') {
+                    return { ok: false, reason: 'elementIsDisabled' };
+                }
+                return { ok: true, reason: 'elementIsFreshAndUsable' };
+            };
+            const getPointerReceivable = (element) => {
+                const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+                const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
+                return targetRectangles.some((rect) => {
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    const hitElement = document.elementFromPoint(centerX, centerY);
+                    return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
+                });
+            };
+            const resolveCurrentElement = () => document.querySelector(selector);
+            const initialElement = resolveCurrentElement();
+            const initialValidation = isUsableElement(initialElement);
+            if (!initialValidation.ok) {
+                resolve({
+                    ok: false,
+                    reason: initialValidation.reason,
+                    selector,
+                    selectorRefreshRecommended: true,
+                    elementSummary: summarizeElement(initialElement),
+                });
+                return;
+            }
+
+            window.requestAnimationFrame(() => {
+                const freshElement = resolveCurrentElement();
+                const freshValidation = isUsableElement(freshElement);
+                if (!freshValidation.ok) {
+                    resolve({
+                        ok: false,
+                        reason: freshValidation.reason,
+                        selector,
+                        selectorRefreshRecommended: true,
+                        elementSummary: summarizeElement(freshElement),
+                    });
+                    return;
+                }
+
+                const pointerReceivable = getPointerReceivable(freshElement);
+                try {
+                    freshElement.click();
+                    resolve({
+                        ok: true,
+                        reason: 'clickedFreshDomElement',
+                        selector,
+                        clickMethod: 'HTMLElement.click',
+                        pointerReceivable,
+                        elementSummary: summarizeElement(freshElement),
+                    });
+                } catch (error) {
+                    resolve({
+                        ok: false,
+                        reason: 'domClickRaisedException',
+                        selector,
+                        selectorRefreshRecommended: true,
+                        errorName: error && error.name ? error.name : '',
+                        errorMessage: error && error.message ? error.message : String(error),
+                        pointerReceivable,
+                        elementSummary: summarizeElement(freshElement),
+                    });
+                }
+            });
+        })
+        """,
+        selector,
+    )
+
+
+def clickResolvedSelectorAndWait(
+    page: Page,
+    selector: str,
+    refreshResolution: Callable[[], dict[str, Any]] | None = None,
+    returnOnRefreshResolutionFailure: bool = False,
+) -> dict[str, Any]:
+    previousFingerprint = getPageFingerprint(page)
+    previousRenderedStateFingerprint = getRenderedStateFingerprint(page)
+    currentSelector = selector
+    clickAttempts: list[dict[str, Any]] = []
+    refreshedResolutions: list[dict[str, Any]] = []
+    seenRefreshedResolutionFingerprints: set[str] = set()
+
+    def buildClickOutcome(
+        clickCompleted: bool,
+        clickAbortedReason: str | None = None,
+        refreshResolutionFailure: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        renderObservation = waitForRenderCycle(page)
+        currentFingerprint = getPageFingerprint(page)
+        currentRenderedStateFingerprint = getRenderedStateFingerprint(page)
+        pageFingerprintChanged = previousFingerprint != currentFingerprint
+        renderedStateChanged = previousRenderedStateFingerprint != currentRenderedStateFingerprint
+        stateChanged = pageFingerprintChanged or renderedStateChanged
+        return {
+            "previousFingerprintHash": buildShortHash(previousFingerprint),
+            "currentFingerprintHash": buildShortHash(currentFingerprint),
+            "previousRenderedStateFingerprintHash": buildShortHash(previousRenderedStateFingerprint),
+            "currentRenderedStateFingerprintHash": buildShortHash(currentRenderedStateFingerprint),
+            "pageFingerprintChanged": pageFingerprintChanged,
+            "renderedStateChanged": renderedStateChanged,
+            "stateChanged": stateChanged,
+            "fingerprintChanged": stateChanged,
+            "clickCompleted": clickCompleted,
+            "clickAborted": not clickCompleted,
+            "clickAbortedReason": clickAbortedReason,
+            "refreshResolutionFailure": refreshResolutionFailure,
+            "initialSelector": selector,
+            "finalSelector": currentSelector,
+            "clickAttempts": clickAttempts,
+            "refreshedResolutions": refreshedResolutions,
+            "renderObservation": renderObservation,
+        }
+
+    while True:
+        clickAttempt = clickSelectorUsingFreshDomElement(page, currentSelector)
+        clickAttempts.append(clickAttempt)
+        if clickAttempt.get("ok"):
+            break
+
+        if refreshResolution is None or not clickAttempt.get("selectorRefreshRecommended"):
+            if returnOnRefreshResolutionFailure:
+                return buildClickOutcome(
+                    clickCompleted=False,
+                    clickAbortedReason="freshDomClickFailedWithoutRefreshPath",
+                )
+            raise WikiGachaAutomationError(
+                "Resolved selector could not be clicked because the target element was no longer fresh in the DOM. "
+                "Inspect the clickAttempts payload for the upstream stale-element cause."
+            )
+
+        refreshedResolution = refreshResolution()
+        refreshedResolutions.append(refreshedResolution)
+        if not refreshedResolution.get("ok"):
+            if returnOnRefreshResolutionFailure:
+                return buildClickOutcome(
+                    clickCompleted=False,
+                    clickAbortedReason="refreshResolutionReturnedNoFreshTarget",
+                    refreshResolutionFailure=refreshedResolution,
+                )
+            raise WikiGachaAutomationError(
+                refreshedResolution.get(
+                    "reason",
+                    "Resolved selector became stale and no fresh replacement target could be resolved.",
+                )
+            )
+
+        refreshedResolutionFingerprint = buildResolutionFingerprint(refreshedResolution)
+        if refreshedResolutionFingerprint in seenRefreshedResolutionFingerprints:
+            if returnOnRefreshResolutionFailure:
+                return buildClickOutcome(
+                    clickCompleted=False,
+                    clickAbortedReason="refreshedResolutionRepeatedBeforeClick",
+                    refreshResolutionFailure=refreshedResolution,
+                )
+            raise WikiGachaAutomationError(
+                "Resolved selector repeatedly became stale after semantic refresh; the page is replacing the same target "
+                "before it can be clicked. Inspect refreshedResolutions and clickAttempts evidence."
+            )
+        seenRefreshedResolutionFingerprints.add(refreshedResolutionFingerprint)
+        currentSelector = refreshedResolution["selector"]
+
+    return buildClickOutcome(clickCompleted=True)
+
+
+def resolveInsufficientPackRecoverySelector(
+    page: Page,
+    insufficientPackHeadingXPathValue: str,
+    recoverPackButtonXPathValue: str,
+) -> dict[str, Any]:
+    return page.evaluate(
+        r"""
+        ({ insufficientPackHeadingXPathValue, recoverPackButtonXPathValue }) => {
+            const markerPrefix = `auto-wikigacha-insufficient-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const actionableSelector = [
+                'button',
+                'a[href]',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]'
+            ].join(',');
+            const insufficientPackPatterns = [
+                /卡包不足/iu,
+                /pack\s*(?:unavailable|insufficient|depleted|empty|not\s+enough)/iu,
+                /(?:unavailable|insufficient|depleted|empty|not\s+enough)\s*pack/iu,
+                /パック.*不足|不足.*パック/iu,
+            ];
+            const recoveryActionPatterns = [
+                /觀看廣告恢復/iu,
+                /观看广告恢复/iu,
+                /廣告.*恢復|恢復.*廣告/iu,
+                /广告.*恢复|恢复.*广告/iu,
+                /watch.*ad.*(?:recover|restore|refill|reward)/iu,
+                /(?:recover|restore|refill|reward).*watch.*ad/iu,
+                /広告.*回復|回復.*広告/iu,
+            ];
+            const negativeActionPatterns = [
+                /圖鑑|图鉴|図鑑/iu,
+                /對戰|对战|battle|バトル/iu,
+                /獎盃|奖杯|trophy/iu,
+                /遊戲說明|游戏说明|help|rule/iu,
+                /privacy|policy|terms|contact/iu,
+                /隱私|隐私|條款|条款|聯絡|联系/iu,
+            ];
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+            const getElementText = (element) => {
+                if (!element) {
+                    return '';
+                }
+                return normalizeWhitespace([
+                    element.innerText,
+                    element.textContent,
+                    element.getAttribute ? element.getAttribute('aria-label') : '',
+                    element.getAttribute ? element.getAttribute('title') : '',
+                    element.getAttribute ? element.getAttribute('value') : '',
+                    element.id,
+                    getClassText(element),
+                    ...Array.from(element.querySelectorAll ? element.querySelectorAll('img[alt]') : [])
+                        .map((image) => image.getAttribute('alt')),
                 ].filter(Boolean).join(' '));
             };
             const isVisible = (element) => {
@@ -1128,16 +1870,21 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                     return null;
                 }
             };
-            const summarize = (element, source) => {
+            const getEvidenceCount = (patterns, text) => patterns
+                .map((pattern) => pattern.test(text))
+                .filter(Boolean)
+                .length;
+            const summarizeAction = (element, source, heading) => {
                 const rect = element.getBoundingClientRect();
                 const style = window.getComputedStyle(element);
                 return {
-                    text: getNormalizedText(element).slice(0, 260),
+                    source,
+                    text: getElementText(element).slice(0, 260),
+                    headingText: heading ? getElementText(heading).slice(0, 260) : '',
                     tagName: element.tagName.toLowerCase(),
                     role: element.getAttribute('role') || '',
-                    href: element.getAttribute('href') || '',
                     id: element.id || '',
-                    source,
+                    className: getClassText(element).slice(0, 260),
                     pointerReceivable: isPointerReceivable(element),
                     cursor: style.cursor,
                     area: rect.width * rect.height,
@@ -1146,39 +1893,69 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                 };
             };
 
-            const configuredElement = resolveXPathElement(returnButtonXPath);
-            if (configuredElement instanceof HTMLElement && isVisible(configuredElement) && isPointerReceivable(configuredElement)) {
-                const marker = `${markerPrefix}-configured-xpath`;
-                configuredElement.setAttribute('data-auto-wikigacha-return', marker);
+            const configuredHeading = resolveXPathElement(insufficientPackHeadingXPathValue);
+            const headingCandidates = [
+                configuredHeading,
+                ...Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]')),
+            ]
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isVisible)
+                .filter((element, index, allElements) => index === allElements.findIndex((other) => other === element))
+                .filter((element) => getEvidenceCount(insufficientPackPatterns, getElementText(element)) > 0);
+
+            if (headingCandidates.length === 0) {
                 return {
-                    ok: true,
-                    selector: `[data-auto-wikigacha-return="${marker}"]`,
-                    selected: summarize(configuredElement, 'configuredXPath'),
-                    candidates: [summarize(configuredElement, 'configuredXPath')],
+                    ok: false,
+                    reason: 'No visible insufficient-pack heading was detected.',
+                    insufficientPackHeadingXPath: insufficientPackHeadingXPathValue,
+                    configuredHeadingVisible: configuredHeading instanceof HTMLElement ? isVisible(configuredHeading) : false,
+                    configuredHeadingText: configuredHeading instanceof HTMLElement ? getElementText(configuredHeading).slice(0, 260) : '',
+                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
                 };
             }
 
-            const candidates = Array.from(document.querySelectorAll(semanticCandidateSelector))
+            const selectedHeading = headingCandidates[0];
+            const configuredButton = resolveXPathElement(recoverPackButtonXPathValue);
+            const configuredButtonIsValid = configuredButton instanceof HTMLElement
+                && isVisible(configuredButton)
+                && isPointerReceivable(configuredButton)
+                && getEvidenceCount(negativeActionPatterns, getElementText(configuredButton)) === 0;
+            if (configuredButtonIsValid) {
+                const marker = `${markerPrefix}-configured-recovery-button`;
+                configuredButton.setAttribute('data-auto-wikigacha-insufficient', marker);
+                return {
+                    ok: true,
+                    selector: `[data-auto-wikigacha-insufficient="${marker}"]`,
+                    selected: summarizeAction(configuredButton, 'configuredRecoverPackButtonXPath', selectedHeading),
+                    candidates: [summarizeAction(configuredButton, 'configuredRecoverPackButtonXPath', selectedHeading)],
+                };
+            }
+
+            const candidates = Array.from(document.querySelectorAll(actionableSelector))
                 .filter((element) => element instanceof HTMLElement)
                 .filter(isVisible)
                 .filter(isPointerReceivable)
                 .map((element, index) => {
-                    const text = getNormalizedText(element);
+                    const text = getElementText(element);
+                    const rect = element.getBoundingClientRect();
                     return {
                         element,
                         marker: `${markerPrefix}-semantic-${index}`,
-                        text,
-                        evidence: returnPatterns.map((pattern) => pattern.test(text)).filter(Boolean).length,
-                        summary: summarize(element, 'semanticFallback'),
+                        recoveryEvidence: getEvidenceCount(recoveryActionPatterns, text),
+                        negativeEvidence: getEvidenceCount(negativeActionPatterns, text),
+                        area: rect.width * rect.height,
+                        top: rect.top,
+                        left: rect.left,
                     };
                 })
-                .filter((candidate) => candidate.evidence > 0)
+                .filter((candidate) => candidate.recoveryEvidence > 0)
+                .filter((candidate) => candidate.negativeEvidence === 0)
                 .sort((left, right) => {
                     const comparisons = [
-                        right.evidence - left.evidence,
-                        right.summary.area - left.summary.area,
-                        left.summary.top - right.summary.top,
-                        left.summary.left - right.summary.left,
+                        right.recoveryEvidence - left.recoveryEvidence,
+                        right.area - left.area,
+                        left.top - right.top,
+                        left.left - right.left,
                     ];
                     return comparisons.find((comparison) => comparison !== 0) || 0;
                 });
@@ -1186,39 +1963,351 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
             if (candidates.length === 0) {
                 return {
                     ok: false,
-                    reason: 'No visible return-to-pack-page button was found.',
-                    configuredXPath: returnButtonXPath,
-                    configuredXPathVisible: configuredElement instanceof HTMLElement ? isVisible(configuredElement) : false,
-                    configuredXPathPointerReceivable: configuredElement instanceof HTMLElement ? isPointerReceivable(configuredElement) : false,
+                    reason: 'Insufficient-pack state was detected, but no recovery action button was resolved.',
+                    insufficientPackHeadingXPath: insufficientPackHeadingXPathValue,
+                    recoverPackButtonXPath: recoverPackButtonXPathValue,
+                    configuredButtonVisible: configuredButton instanceof HTMLElement ? isVisible(configuredButton) : false,
+                    configuredButtonPointerReceivable: configuredButton instanceof HTMLElement ? isPointerReceivable(configuredButton) : false,
+                    headingText: getElementText(selectedHeading).slice(0, 260),
                     visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
                 };
             }
 
             const selectedCandidate = candidates[0];
-            selectedCandidate.element.setAttribute('data-auto-wikigacha-return', selectedCandidate.marker);
+            selectedCandidate.element.setAttribute('data-auto-wikigacha-insufficient', selectedCandidate.marker);
             return {
                 ok: true,
-                selector: `[data-auto-wikigacha-return="${selectedCandidate.marker}"]`,
-                selected: selectedCandidate.summary,
-                candidates: candidates.map((candidate) => candidate.summary),
+                selector: `[data-auto-wikigacha-insufficient="${selectedCandidate.marker}"]`,
+                selected: summarizeAction(selectedCandidate.element, 'semanticRecoveryAction', selectedHeading),
+                candidates: candidates.map((candidate) => summarizeAction(candidate.element, 'semanticRecoveryAction', selectedHeading)),
             };
         }
         """,
-        returnButtonXPath,
+        {
+            "insufficientPackHeadingXPathValue": insufficientPackHeadingXPathValue,
+            "recoverPackButtonXPathValue": recoverPackButtonXPathValue,
+        },
     )
 
 
-def clickResolvedSelectorAndWait(page: Page, selector: str) -> dict[str, Any]:
-    previousFingerprint = getPageFingerprint(page)
-    page.locator(selector).click(timeout=0)
-    renderObservation = waitForRenderCycle(page)
-    currentFingerprint = getPageFingerprint(page)
-    return {
-        "previousFingerprintHash": buildShortHash(previousFingerprint),
-        "currentFingerprintHash": buildShortHash(currentFingerprint),
-        "fingerprintChanged": previousFingerprint != currentFingerprint,
-        "renderObservation": renderObservation,
+def resolveAdRewardConfirmationSelector(page: Page, adRewardConfirmButtonXPathValue: str) -> dict[str, Any]:
+    return page.evaluate(
+        r"""
+        (adRewardConfirmButtonXPathValue) => {
+            const markerPrefix = `auto-wikigacha-ad-confirm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const actionableSelector = [
+                'button',
+                'a[href]',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]'
+            ].join(',');
+            const confirmationPatterns = [
+                /^(?:確定|確認|關閉|關掉|領取|獲得|取得|完成|繼續|開始|好|OK)$/iu,
+                /^(?:确定|确认|关闭|领取|获得|取得|完成|继续|开始|好|OK)$/iu,
+                /(?:claim|collect|get|receive|close|continue|done|confirm|ok|reward)/iu,
+                /^(?:閉じる|確認|受け取る|獲得|取得|完了|続ける|OK)$/iu,
+            ];
+            const negativePatterns = [
+                /圖鑑|图鉴|図鑑/iu,
+                /對戰|对战|battle|バトル/iu,
+                /獎盃|奖杯|trophy/iu,
+                /遊戲說明|游戏说明|help|rule/iu,
+                /privacy|policy|terms|contact/iu,
+                /隱私|隐私|條款|条款|聯絡|联系/iu,
+            ];
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+            const getElementText = (element) => {
+                if (!element) {
+                    return '';
+                }
+                return normalizeWhitespace([
+                    element.innerText,
+                    element.textContent,
+                    element.getAttribute ? element.getAttribute('aria-label') : '',
+                    element.getAttribute ? element.getAttribute('title') : '',
+                    element.getAttribute ? element.getAttribute('value') : '',
+                    element.id,
+                    getClassText(element),
+                    ...Array.from(element.querySelectorAll ? element.querySelectorAll('img[alt]') : [])
+                        .map((image) => image.getAttribute('alt')),
+                ].filter(Boolean).join(' '));
+            };
+            const isVisible = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && !element.hasAttribute('disabled')
+                    && element.getAttribute('aria-disabled') !== 'true';
+            };
+            const isPointerReceivable = (element) => {
+                const rect = element.getBoundingClientRect();
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                const hitElement = document.elementFromPoint(centerX, centerY);
+                return Boolean(hitElement && (element === hitElement || element.contains(hitElement)));
+            };
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(
+                        xpath,
+                        document,
+                        null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE,
+                        null,
+                    ).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
+            const getEvidenceCount = (patterns, text) => patterns
+                .map((pattern) => pattern.test(text))
+                .filter(Boolean)
+                .length;
+            const summarizeAction = (element, source) => {
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+                return {
+                    source,
+                    text: getElementText(element).slice(0, 260),
+                    tagName: element.tagName.toLowerCase(),
+                    role: element.getAttribute('role') || '',
+                    id: element.id || '',
+                    className: getClassText(element).slice(0, 260),
+                    pointerReceivable: isPointerReceivable(element),
+                    cursor: style.cursor,
+                    area: rect.width * rect.height,
+                    top: rect.top,
+                    left: rect.left,
+                };
+            };
+
+            const configuredButton = resolveXPathElement(adRewardConfirmButtonXPathValue);
+            if (configuredButton instanceof HTMLElement && isVisible(configuredButton) && isPointerReceivable(configuredButton)) {
+                const marker = `${markerPrefix}-configured-xpath`;
+                configuredButton.setAttribute('data-auto-wikigacha-ad-confirm', marker);
+                return {
+                    ok: true,
+                    selector: `[data-auto-wikigacha-ad-confirm="${marker}"]`,
+                    selected: summarizeAction(configuredButton, 'configuredAdRewardConfirmButtonXPath'),
+                    candidates: [summarizeAction(configuredButton, 'configuredAdRewardConfirmButtonXPath')],
+                };
+            }
+
+            const candidates = Array.from(document.querySelectorAll(actionableSelector))
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isVisible)
+                .filter(isPointerReceivable)
+                .map((element, index) => {
+                    const text = getElementText(element);
+                    const rect = element.getBoundingClientRect();
+                    return {
+                        element,
+                        marker: `${markerPrefix}-semantic-${index}`,
+                        confirmationEvidence: getEvidenceCount(confirmationPatterns, text),
+                        negativeEvidence: getEvidenceCount(negativePatterns, text),
+                        area: rect.width * rect.height,
+                        top: rect.top,
+                        left: rect.left,
+                    };
+                })
+                .filter((candidate) => candidate.confirmationEvidence > 0)
+                .filter((candidate) => candidate.negativeEvidence === 0)
+                .sort((left, right) => {
+                    const comparisons = [
+                        right.confirmationEvidence - left.confirmationEvidence,
+                        right.area - left.area,
+                        right.top - left.top,
+                        left.left - right.left,
+                    ];
+                    return comparisons.find((comparison) => comparison !== 0) || 0;
+                });
+
+            if (candidates.length === 0) {
+                return {
+                    ok: false,
+                    reason: 'No visible ad-reward confirmation button was resolved.',
+                    adRewardConfirmButtonXPath: adRewardConfirmButtonXPathValue,
+                    configuredButtonVisible: configuredButton instanceof HTMLElement ? isVisible(configuredButton) : false,
+                    configuredButtonPointerReceivable: configuredButton instanceof HTMLElement ? isPointerReceivable(configuredButton) : false,
+                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
+                };
+            }
+
+            const selectedCandidate = candidates[0];
+            selectedCandidate.element.setAttribute('data-auto-wikigacha-ad-confirm', selectedCandidate.marker);
+            return {
+                ok: true,
+                selector: `[data-auto-wikigacha-ad-confirm="${selectedCandidate.marker}"]`,
+                selected: summarizeAction(selectedCandidate.element, 'semanticAdRewardConfirmationAction'),
+                candidates: candidates.map((candidate) => summarizeAction(candidate.element, 'semanticAdRewardConfirmationAction')),
+            };
+        }
+        """,
+        adRewardConfirmButtonXPathValue,
+    )
+
+
+def waitForAdRewardConfirmationTarget(page: Page, adRewardConfirmButtonXPathValue: str) -> None:
+    page.wait_for_function(
+        r"""
+        (adRewardConfirmButtonXPathValue) => {
+            const actionableSelector = [
+                'button',
+                'a[href]',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]'
+            ].join(',');
+            const confirmationPatterns = [
+                /^(?:確定|確認|關閉|關掉|領取|獲得|取得|完成|繼續|開始|好|OK)$/iu,
+                /^(?:确定|确认|关闭|领取|获得|取得|完成|继续|开始|好|OK)$/iu,
+                /(?:claim|collect|get|receive|close|continue|done|confirm|ok|reward)/iu,
+                /^(?:閉じる|確認|受け取る|獲得|取得|完了|続ける|OK)$/iu,
+            ];
+            const negativePatterns = [
+                /圖鑑|图鉴|図鑑/iu,
+                /對戰|对战|battle|バトル/iu,
+                /獎盃|奖杯|trophy/iu,
+                /遊戲說明|游戏说明|help|rule/iu,
+                /privacy|policy|terms|contact/iu,
+                /隱私|隐私|條款|条款|聯絡|联系/iu,
+            ];
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+            const getElementText = (element) => {
+                if (!element) {
+                    return '';
+                }
+                return normalizeWhitespace([
+                    element.innerText,
+                    element.textContent,
+                    element.getAttribute ? element.getAttribute('aria-label') : '',
+                    element.getAttribute ? element.getAttribute('title') : '',
+                    element.getAttribute ? element.getAttribute('value') : '',
+                    element.id,
+                    getClassText(element),
+                ].filter(Boolean).join(' '));
+            };
+            const isVisible = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && !element.hasAttribute('disabled')
+                    && element.getAttribute('aria-disabled') !== 'true';
+            };
+            const isPointerReceivable = (element) => {
+                const rect = element.getBoundingClientRect();
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                const hitElement = document.elementFromPoint(centerX, centerY);
+                return Boolean(hitElement && (element === hitElement || element.contains(hitElement)));
+            };
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
+            const configuredButton = resolveXPathElement(adRewardConfirmButtonXPathValue);
+            if (configuredButton instanceof HTMLElement && isVisible(configuredButton) && isPointerReceivable(configuredButton)) {
+                return true;
+            }
+            return Array.from(document.querySelectorAll(actionableSelector))
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isVisible)
+                .filter(isPointerReceivable)
+                .some((element) => {
+                    const text = getElementText(element);
+                    return confirmationPatterns.some((pattern) => pattern.test(text))
+                        && !negativePatterns.some((pattern) => pattern.test(text));
+                });
+        }
+        """,
+        arg=adRewardConfirmButtonXPathValue,
+        timeout=0,
+    )
+
+
+def recoverFromInsufficientPackIfPresent(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+) -> bool:
+    recoveryResolution = resolveInsufficientPackRecoverySelector(
+        page,
+        arguments.insufficientPackHeadingXPath,
+        arguments.recoverPackButtonXPath,
+    )
+    if not recoveryResolution.get("ok"):
+        return False
+
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_insufficient_pack_recovery_target", recoveryResolution)
+    if arguments.dryRun:
+        print("[DRY-RUN] Insufficient-pack recovery target resolved; recovery clicks skipped.")
+        return True
+
+    recoveryClickPayload = {
+        "recoveryResolution": recoveryResolution,
+        **clickResolvedSelectorAndWait(
+            page,
+            recoveryResolution["selector"],
+            lambda: resolveInsufficientPackRecoverySelector(
+                page,
+                arguments.insufficientPackHeadingXPath,
+                arguments.recoverPackButtonXPath,
+            ),
+        ),
     }
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_insufficient_pack_recovery_clicked", recoveryClickPayload)
+
+    waitForAdRewardConfirmationTarget(page, arguments.adRewardConfirmButtonXPath)
+    confirmationResolution = resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath)
+    if not confirmationResolution.get("ok"):
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_ad_reward_confirmation_missing",
+            confirmationResolution,
+        )
+        raise WikiGachaAutomationError(
+            confirmationResolution.get("reason", "No ad-reward confirmation button was found after pack recovery was requested.")
+        )
+
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_reward_confirmation_target", confirmationResolution)
+    confirmationClickPayload = {
+        "confirmationResolution": confirmationResolution,
+        **clickResolvedSelectorAndWait(
+            page,
+            confirmationResolution["selector"],
+            lambda: resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath),
+        ),
+    }
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_reward_confirmation_clicked", confirmationClickPayload)
+    waitForRenderCycle(page)
+    print("[INFO] Insufficient-pack recovery flow completed; resuming pack opening.")
+    return True
 
 
 def completePackOpening(
@@ -1234,6 +2323,12 @@ def completePackOpening(
     hasClickedOpeningTarget = False
 
     while True:
+        if recoverFromInsufficientPackIfPresent(page, evidencePath, arguments, drawIndex):
+            if arguments.dryRun:
+                return True
+            seenOpeningStateHashes.clear()
+            waitForRenderCycle(page)
+
         returnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
         if returnResolution.get("ok"):
             saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_return_to_pack_target", returnResolution)
@@ -1242,21 +2337,25 @@ def completePackOpening(
                 return True
             returnPayload = {
                 "returnResolution": returnResolution,
-                **clickResolvedSelectorAndWait(page, returnResolution["selector"]),
+                **clickResolvedSelectorAndWait(
+                    page,
+                    returnResolution["selector"],
+                    lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+                ),
             }
-            if not returnPayload.get("fingerprintChanged"):
+            if not returnPayload.get("stateChanged"):
                 saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_return_no_change_after_click", returnPayload)
                 raise WikiGachaAutomationError(
-                    "Return-to-pack-page button was clicked, but the page fingerprint did not change. "
+                    "Return-to-pack-page button was clicked, but neither DOM nor rendered page state changed. "
                     "Inspect the return target evidence JSON/screenshot."
                 )
             saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
             return True
 
-        openingStateHash = buildShortHash(getPageFingerprint(page))
+        openingStateHash = buildShortHash(getPageStateFingerprint(page))
         if openingStateHash in seenOpeningStateHashes:
             repeatPayload = {
-                "reason": "Opening flow reached a repeated page state before the return-to-pack-page button appeared.",
+                "reason": "Opening flow reached a repeated rendered page state before the return-to-pack-page button appeared.",
                 "openingStateHash": openingStateHash,
                 "returnResolution": returnResolution,
             }
@@ -1282,9 +2381,50 @@ def completePackOpening(
                 targetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
 
         if not targetResolution.get("ok"):
+            recoveredInsufficientPack = recoverFromInsufficientPackIfPresent(page, evidencePath, arguments, drawIndex)
+            if recoveredInsufficientPack:
+                if arguments.dryRun:
+                    return True
+                seenOpeningStateHashes.clear()
+                waitForRenderCycle(page)
+                targetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
+
+        if not targetResolution.get("ok"):
+            refreshedReturnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
+            if refreshedReturnResolution.get("ok"):
+                saveEvidence(
+                    page,
+                    evidencePath,
+                    f"draw_{drawIndex:03d}_return_to_pack_after_target_suppressed",
+                    {
+                        "targetResolution": targetResolution,
+                        "returnResolution": refreshedReturnResolution,
+                    },
+                )
+                if arguments.dryRun:
+                    return True
+                returnPayload = {
+                    "returnResolution": refreshedReturnResolution,
+                    "targetResolutionBeforeReturn": targetResolution,
+                    **clickResolvedSelectorAndWait(
+                        page,
+                        refreshedReturnResolution["selector"],
+                        lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+                    ),
+                }
+                if not returnPayload.get("stateChanged"):
+                    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_return_after_target_suppressed_no_change", returnPayload)
+                    raise WikiGachaAutomationError(
+                        "Result-page draw targets were suppressed and the return-to-pack button was clicked, "
+                        "but neither DOM nor rendered page state changed."
+                    )
+                saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
+                return True
+
             noTargetPayload = {
                 "targetResolution": targetResolution,
                 "returnResolution": returnResolution,
+                "refreshedReturnResolution": refreshedReturnResolution,
                 "openingStateHash": openingStateHash,
                 "hasClickedOpeningTarget": hasClickedOpeningTarget,
                 "allowNoInitialTarget": allowNoInitialTarget,
@@ -1307,14 +2447,46 @@ def completePackOpening(
         progressPayload = {
             "targetResolution": targetResolution,
             "returnResolutionBeforeClick": returnResolution,
-            **clickResolvedSelectorAndWait(page, targetResolution["selector"]),
+            **clickResolvedSelectorAndWait(
+                page,
+                targetResolution["selector"],
+                lambda: resolveDrawTargetSelector(page, arguments.returnToPackPageXPath),
+                returnOnRefreshResolutionFailure=True,
+            ),
         }
         hasClickedOpeningTarget = True
-        if not progressPayload.get("fingerprintChanged"):
+        if not progressPayload.get("stateChanged"):
+            returnResolutionAfterNoChange = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
+            progressPayload["returnResolutionAfterNoChange"] = returnResolutionAfterNoChange
+            if returnResolutionAfterNoChange.get("ok"):
+                recoveryEvidenceLabel = "aborted_target_return_recovered" if progressPayload.get("clickAborted") else "no_change_return_recovered"
+                saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_{recoveryEvidenceLabel}", progressPayload)
+                returnPayload = {
+                    "returnResolution": returnResolutionAfterNoChange,
+                    "noChangeTargetPayload": progressPayload,
+                    **clickResolvedSelectorAndWait(
+                        page,
+                        returnResolutionAfterNoChange["selector"],
+                        lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+                    ),
+                }
+                if not returnPayload.get("stateChanged"):
+                    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_return_after_no_change_target_no_change", returnPayload)
+                    raise WikiGachaAutomationError(
+                        "A stale or already-consumed continuation target produced no state change; "
+                        "a return-to-pack button was found, but clicking it also produced no state change."
+                    )
+                saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
+                return True
+
+            refreshedTargetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
+            progressPayload["refreshedTargetResolutionAfterNoChange"] = refreshedTargetResolution
             saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_no_change_after_click", progressPayload)
             raise WikiGachaAutomationError(
-                "Pack/card continuation target was clicked, but the page fingerprint did not change. "
-                "Inspect the target evidence JSON/screenshot."
+                "Pack/card continuation target could not make progress. "
+                "The most likely upstream cause is that the originally resolved target became stale and the fresh resolver either suppressed "
+                "result-page controls or found no unrevealed pack target. Inspect clickAttempts, refreshResolutionFailure, "
+                "refreshedTargetResolutionAfterNoChange, and returnResolutionAfterNoChange evidence."
             )
         saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_result", progressPayload)
 
@@ -1342,7 +2514,11 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
     page.goto(arguments.url, wait_until="domcontentloaded", timeout=0)
     waitForPageReady(page)
     dismissedGates = dismissEntryGates(page, evidencePath, rememberDismissal=not arguments.keepEntryNotices)
-    initialRemainingPackResolution = resolveRemainingPackCount(page, arguments.remainingPackCountXPath)
+    initialRemainingPackResolution = resolveRemainingPackCount(
+        page,
+        arguments.remainingPackCountXPath,
+        arguments.insufficientPackHeadingXPath,
+    )
     saveEvidence(
         page,
         evidencePath,
@@ -1353,6 +2529,9 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
             "dismissedGates": dismissedGates,
             "returnToPackPageXPath": arguments.returnToPackPageXPath,
             "remainingPackCountXPath": arguments.remainingPackCountXPath,
+            "insufficientPackHeadingXPath": arguments.insufficientPackHeadingXPath,
+            "recoverPackButtonXPath": arguments.recoverPackButtonXPath,
+            "adRewardConfirmButtonXPath": arguments.adRewardConfirmButtonXPath,
             "remainingPackResolution": initialRemainingPackResolution,
         },
     )
@@ -1360,7 +2539,11 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
     completedDrawCount = 0
     drawIndex = 1
     while arguments.drawCount is None or drawIndex <= arguments.drawCount:
-        remainingPackResolutionBeforeDraw = resolveRemainingPackCount(page, arguments.remainingPackCountXPath)
+        remainingPackResolutionBeforeDraw = resolveRemainingPackCount(
+            page,
+            arguments.remainingPackCountXPath,
+            arguments.insufficientPackHeadingXPath,
+        )
         remainingPacksBeforeDraw = hasRemainingPacks(remainingPackResolutionBeforeDraw)
         saveEvidence(
             page,
@@ -1374,19 +2557,52 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
         )
 
         if remainingPacksBeforeDraw is False:
-            saveEvidence(
-                page,
-                evidencePath,
-                "remaining_pack_count_exhausted",
-                {
-                    "completedDrawCount": completedDrawCount,
-                    "nextDrawIndex": drawIndex,
-                    "drawRunMode": getDrawRunMode(arguments),
-                    "remainingPackResolution": remainingPackResolutionBeforeDraw,
-                },
-            )
-            print("[INFO] Remaining pack counter reached zero; adaptive run is complete.")
-            break
+            recoveredInsufficientPack = recoverFromInsufficientPackIfPresent(page, evidencePath, arguments, drawIndex)
+            if recoveredInsufficientPack:
+                if arguments.dryRun:
+                    saveEvidence(
+                        page,
+                        evidencePath,
+                        "dry_run_completed_after_insufficient_pack_recovery_resolution",
+                        {
+                            "completedDrawCount": completedDrawCount,
+                            "nextDrawIndex": drawIndex,
+                            "drawRunMode": getDrawRunMode(arguments),
+                            "remainingPackResolution": remainingPackResolutionBeforeDraw,
+                        },
+                    )
+                    break
+                remainingPackResolutionBeforeDraw = resolveRemainingPackCount(
+                    page,
+                    arguments.remainingPackCountXPath,
+                    arguments.insufficientPackHeadingXPath,
+                )
+                remainingPacksBeforeDraw = hasRemainingPacks(remainingPackResolutionBeforeDraw)
+                saveEvidence(
+                    page,
+                    evidencePath,
+                    f"draw_{drawIndex:03d}_remaining_pack_count_after_recovery",
+                    {
+                        "completedDrawCount": completedDrawCount,
+                        "drawRunMode": getDrawRunMode(arguments),
+                        "remainingPackResolution": remainingPackResolutionBeforeDraw,
+                    },
+                )
+
+            if remainingPacksBeforeDraw is False:
+                saveEvidence(
+                    page,
+                    evidencePath,
+                    "remaining_pack_count_exhausted",
+                    {
+                        "completedDrawCount": completedDrawCount,
+                        "nextDrawIndex": drawIndex,
+                        "drawRunMode": getDrawRunMode(arguments),
+                        "remainingPackResolution": remainingPackResolutionBeforeDraw,
+                    },
+                )
+                print("[INFO] Remaining pack counter reached zero and no adaptive recovery path remained; adaptive run is complete.")
+                break
 
         allowNoInitialTarget = arguments.drawCount is None and remainingPacksBeforeDraw is not True
         print(
@@ -1402,7 +2618,11 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
             allowNoInitialTarget=allowNoInitialTarget,
             initialRemainingPackResolution=remainingPackResolutionBeforeDraw,
         )
-        remainingPackResolutionAfterDraw = resolveRemainingPackCount(page, arguments.remainingPackCountXPath)
+        remainingPackResolutionAfterDraw = resolveRemainingPackCount(
+            page,
+            arguments.remainingPackCountXPath,
+            arguments.insufficientPackHeadingXPath,
+        )
         saveEvidence(
             page,
             evidencePath,
@@ -1459,7 +2679,11 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
             )
         drawIndex += 1
 
-    finalRemainingPackResolution = resolveRemainingPackCount(page, arguments.remainingPackCountXPath)
+    finalRemainingPackResolution = resolveRemainingPackCount(
+        page,
+        arguments.remainingPackCountXPath,
+        arguments.insufficientPackHeadingXPath,
+    )
     saveEvidence(
         page,
         evidencePath,
@@ -1470,6 +2694,9 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
             "drawRunMode": getDrawRunMode(arguments),
             "drawCount": arguments.drawCount,
             "remainingPackCountXPath": arguments.remainingPackCountXPath,
+            "insufficientPackHeadingXPath": arguments.insufficientPackHeadingXPath,
+            "recoverPackButtonXPath": arguments.recoverPackButtonXPath,
+            "adRewardConfirmButtonXPath": arguments.adRewardConfirmButtonXPath,
             "remainingPackResolution": finalRemainingPackResolution,
         },
     )
