@@ -2533,6 +2533,21 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
         (adOverlayCloseButtonXPathValue) => {
             const markerPrefix = `auto-wikigacha-ad-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
             const actionableSelector = [
+                '#reward_close_button_widget #close_button',
+                '#reward_close_button_widget [role="button"]',
+                '#close_button[aria-label]',
+                '#close_button[role="button"]',
+                '#close_button[tabindex]',
+                '#close_button',
+                '#close_button_icon',
+                '[aria-label="關閉影片"]',
+                '[aria-label="关闭影片"]',
+                '[aria-label*="關閉影片"]',
+                '[aria-label*="关闭影片"]',
+                '[aria-label*="關閉廣告"]',
+                '[aria-label*="关闭广告"]',
+                '[aria-label*="close video" i]',
+                '[aria-label*="close ad" i]',
                 'button',
                 'a[href]',
                 '[role="button"]',
@@ -2542,6 +2557,8 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
             const adInterruptionPatterns = [
                 /贊助鏈接|赞助链接|sponsored\s*link/iu,
                 /Monetag/iu,
+                /Google\s*AI\s*Plus|one\.google\.com/iu,
+                /reward_close_button_widget|close_button_icon|close_button/iu,
                 /廣告已暫時停用|广告已暂时停用/iu,
                 /廣告.*暫時.*停用|广告.*暂时.*停用/iu,
                 /ad(?:vertisement)?\s*(?:temporarily\s*)?(?:disabled|unavailable|paused|suspended)/iu,
@@ -2549,11 +2566,13 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
                 /#goog_rewarded|goog_rewarded|rewarded\s*ad|google\s*rewarded/iu,
             ];
             const closeActionPatterns = [
-                /^(?:關閉廣告|关闭广告|關閉|关闭|關掉|關閉視窗|关闭窗口)$/iu,
-                /^(?:close\s*(?:ad|advertisement)?|dismiss)$/iu,
+                /^(?:關閉影片|关闭影片|關閉廣告|关闭广告|關閉|关闭|關掉|關閉視窗|关闭窗口)$/iu,
+                /^(?:close\s*(?:video|ad|advertisement)?|dismiss)$/iu,
                 /^(?:広告を閉じる|閉じる)$/iu,
-                /(?:關閉|关闭|close|dismiss).*(?:廣告|广告|ad|advertisement)/iu,
-                /(?:廣告|广告|ad|advertisement).*(?:關閉|关闭|close|dismiss)/iu,
+                /(?:關閉|关闭|close|dismiss).*(?:影片|廣告|广告|video|ad|advertisement)/iu,
+                /(?:影片|廣告|广告|video|ad|advertisement).*(?:關閉|关闭|close|dismiss)/iu,
+                /^close_button(?:_icon)?$/iu,
+                /reward_close_button_widget/iu,
                 /^\s*[×✕✖x]\s*$/iu,
             ];
             const negativeActionPatterns = [
@@ -2683,6 +2702,7 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
                     className: getClassText(element).slice(0, 260),
                     configuredXPathEvidence: evidence ? evidence.configuredXPathEvidence : 0,
                     closeActionEvidence: evidence ? evidence.closeActionEvidence : 0,
+                    primaryRewardedCloseEvidence: evidence ? evidence.primaryRewardedCloseEvidence : 0,
                     negativeActionEvidence: evidence ? evidence.negativeActionEvidence : 0,
                     pointerReceivable: isPointerReceivable(element),
                     cursor: style.cursor,
@@ -2701,6 +2721,11 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
                     marker: `${markerPrefix}-configured-overlay-close-xpath`,
                     configuredXPathEvidence: 1,
                     closeActionEvidence: 1,
+                    primaryRewardedCloseEvidence: configuredCloseButton.id === 'close_button'
+                        || configuredCloseButton.id === 'close_button_icon'
+                        || configuredCloseButton.closest('#reward_close_button_widget')
+                        ? 1
+                        : 0,
                     negativeActionEvidence: 0,
                     pointerReceivable: isPointerReceivable(configuredCloseButton),
                     source: 'configuredAdOverlayCloseButtonXPath',
@@ -2719,6 +2744,11 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
                             marker: `${markerPrefix}-semantic-${index}`,
                             configuredXPathEvidence: 0,
                             closeActionEvidence: getEvidenceCount(closeActionPatterns, text),
+                            primaryRewardedCloseEvidence: element.id === 'close_button'
+                                || element.id === 'close_button_icon'
+                                || Boolean(element.closest('#reward_close_button_widget'))
+                                ? 1
+                                : 0,
                             negativeActionEvidence: getEvidenceCount(negativeActionPatterns, text),
                             pointerReceivable: isPointerReceivable(element),
                             source: 'semanticAdInterruptionCloseAction',
@@ -2737,11 +2767,14 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
                         left: rect.left,
                     };
                 })
-                .filter((candidate) => candidate.configuredXPathEvidence > 0 || candidate.closeActionEvidence > 0)
+                .filter((candidate) => candidate.configuredXPathEvidence > 0
+                    || candidate.primaryRewardedCloseEvidence > 0
+                    || candidate.closeActionEvidence > 0)
                 .filter((candidate) => candidate.negativeActionEvidence === 0)
                 .sort((left, right) => {
                     const comparisons = [
                         right.configuredXPathEvidence - left.configuredXPathEvidence,
+                        right.primaryRewardedCloseEvidence - left.primaryRewardedCloseEvidence,
                         right.closeActionEvidence - left.closeActionEvidence,
                         Number(right.pointerReceivable) - Number(left.pointerReceivable),
                         right.area - left.area,
@@ -2958,17 +2991,18 @@ def resolveAdCloseConfirmationTargetInFrame(frame: Any, frameIndex: int) -> dict
                     .filter((candidate) => candidate.negativeEvidence === 0)
                     .filter((candidate) => {
                         if (selectedDialog.rewardLossEvidence > 0) {
-                            return candidate.resumeEvidence > 0;
+                            return candidate.closeEvidence > 0 || candidate.resumeEvidence > 0;
                         }
                         return candidate.resumeEvidence > 0 || candidate.closeEvidence > 0;
                     })
                     .sort((left, right) => {
                         const comparisons = selectedDialog.rewardLossEvidence > 0
                             ? [
+                                right.closeEvidence - left.closeEvidence,
                                 right.resumeEvidence - left.resumeEvidence,
                                 Number(right.pointerReceivable) - Number(left.pointerReceivable),
                                 right.area - left.area,
-                                right.left - left.left,
+                                left.left - right.left,
                             ]
                             : [
                                 right.closeEvidence - left.closeEvidence,
@@ -2987,17 +3021,15 @@ def resolveAdCloseConfirmationTargetInFrame(frame: Any, frameIndex: int) -> dict
                         frameIndex,
                         frameName,
                         frameUrl,
-                        source: selectedDialog.rewardLossEvidence > 0
-                            ? 'rewardedAdCloseConfirmationResumeButton'
-                            : candidate.closeEvidence > 0
-                                ? 'rewardedAdCloseConfirmationCloseButton'
-                                : 'rewardedAdCloseConfirmationResumeButton',
+                        source: candidate.closeEvidence > 0
+                            ? 'rewardedAdCloseConfirmationCloseButton'
+                            : 'rewardedAdCloseConfirmationResumeButton',
                         selector: candidate.selector,
-                        actionIntent: selectedDialog.rewardLossEvidence > 0
-                            ? 'resumeVideoToPreserveReward'
-                            : candidate.closeEvidence > 0
-                                ? 'closeVideoAfterConfirmation'
-                                : 'resumeVideo',
+                        actionIntent: candidate.closeEvidence > 0
+                            ? selectedDialog.rewardLossEvidence > 0
+                                ? 'closeVideoAfterRewardLossConfirmation'
+                                : 'closeVideoAfterConfirmation'
+                            : 'resumeVideo',
                         text: candidate.text.slice(0, 260),
                         dialogText: selectedDialog.text.slice(0, 520),
                         tagName: candidate.element.tagName.toLowerCase(),
@@ -3020,7 +3052,7 @@ def resolveAdCloseConfirmationTargetInFrame(frame: Any, frameIndex: int) -> dict
                     return {
                         ok: false,
                         reason: selectedDialog.rewardLossEvidence > 0
-                            ? 'Reward-loss close-confirmation dialog was found, but no safe resume-video action was resolved.'
+                            ? 'Reward-loss close-confirmation dialog was found, but no semantic close-or-resume action was resolved.'
                             : 'Close-confirmation dialog was found, but no semantic confirmation action was resolved.',
                         targetScope: 'frame',
                         frameIndex,
@@ -3096,13 +3128,19 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
             ({ frameIndex, frameName, frameUrl }) => {
                 const markerPrefix = `auto-wikigacha-frame-ad-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
                 const closeCandidateSelector = [
+                    '#reward_close_button_widget #close_button',
+                    '#reward_close_button_widget [role="button"]',
+                    '#close_button[aria-label]',
                     '#close_button[role="button"]',
                     '#close_button[tabindex]',
                     '#close_button',
+                    '#close_button_icon',
                     '[aria-label="關閉影片"]',
                     '[aria-label="关闭影片"]',
                     '[aria-label*="關閉影片"]',
                     '[aria-label*="关闭影片"]',
+                    '[aria-label*="關閉廣告"]',
+                    '[aria-label*="关闭广告"]',
                     '[aria-label*="close video" i]',
                     '[aria-label*="close ad" i]',
                     '[aria-label*="close" i]',
@@ -3118,12 +3156,15 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                     /close\s*video/iu,
                     /關閉廣告|关闭广告/iu,
                     /close\s*(?:ad|advertisement)/iu,
-                    /^close_button$/iu,
+                    /^close_button(?:_icon)?$/iu,
+                    /reward_close_button_widget/iu,
                     /rewarded[_-]?ad[_-]?close/iu,
                     /^\s*[×✕✖x]\s*$/iu,
                 ];
                 const frameEvidencePatterns = [
                     /googlesyndication|safeframe|goog_rewarded|rewarded|google/iu,
+                    /Google\s*AI\s*Plus|one\.google\.com/iu,
+                    /reward_close_button_widget|close_button_icon|close_button/iu,
                     /ad|ads|advertisement/iu,
                 ];
                 const negativePatterns = [
@@ -3217,12 +3258,13 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                     .map((element, index) => {
                         const text = getElementText(element);
                         const frameContextText = `${location.href} ${document.title || ''} ${text}`;
-                        const idEvidence = element.id === 'close_button' ? 2 : 0;
+                        const idEvidence = element.id === 'close_button' ? 2 : element.id === 'close_button_icon' ? 1 : 0;
+                        const widgetEvidence = element.closest('#reward_close_button_widget') ? 2 : 0;
                         const ariaEvidence = /關閉影片|关闭影片|close\s*video/iu.test(element.getAttribute('aria-label') || '') ? 3 : 0;
-                        const closeEvidence = idEvidence + ariaEvidence + getEvidenceCount(closeEvidencePatterns, text);
+                        const closeEvidence = idEvidence + widgetEvidence + ariaEvidence + getEvidenceCount(closeEvidencePatterns, text);
                         const frameEvidence = getEvidenceCount(frameEvidencePatterns, frameContextText);
                         const negativeEvidence = getEvidenceCount(negativePatterns, text);
-                        const isPrimaryRewardedCloseButton = idEvidence > 0 || ariaEvidence > 0;
+                        const isPrimaryRewardedCloseButton = idEvidence > 0 || widgetEvidence > 0 || ariaEvidence > 0;
                         return {
                             element,
                             marker: `${markerPrefix}-${index}`,
@@ -3240,7 +3282,6 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                     })
                     .filter((candidate, index, allCandidates) => index === allCandidates.findIndex((other) => other.element === candidate.element))
                     .filter((candidate) => candidate.negativeEvidence === 0)
-                    .filter((candidate) => !(candidate.rewardPendingEvidence > 0 && candidate.isPrimaryRewardedCloseButton))
                     .filter((candidate) => candidate.closeEvidence > 0 || candidate.frameEvidence > 0)
                     .sort((left, right) => {
                         const comparisons = [
@@ -3255,9 +3296,7 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                 if (candidates.length === 0) {
                     return {
                         ok: false,
-                        reason: rewardPendingEvidence > 0
-                            ? 'Rewarded-ad close button is visible but reward eligibility is still pending; waiting instead of triggering the reward-loss confirmation dialog.'
-                            : 'No visible frame-level rewarded-ad close button was found.',
+                        reason: 'No visible frame-level rewarded-ad close button was found.',
                         targetScope: 'frame',
                         frameIndex,
                         frameName,
