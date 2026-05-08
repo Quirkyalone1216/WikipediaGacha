@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -31,6 +32,10 @@ class WikiGachaAutomationError(RuntimeError):
     pass
 
 
+class BrowserLifecycleRestartRequired(WikiGachaAutomationError):
+    pass
+
+
 saveRoutineEvidence = False
 evidenceEventTrail: list[dict[str, Any]] = []
 
@@ -38,6 +43,10 @@ evidenceEventTrail: list[dict[str, Any]] = []
 def setRoutineEvidenceEnabled(enabled: bool) -> None:
     global saveRoutineEvidence
     saveRoutineEvidence = enabled
+
+
+def resetEvidenceEventTrail() -> None:
+    evidenceEventTrail.clear()
 
 
 def parseArguments() -> argparse.Namespace:
@@ -189,12 +198,24 @@ def parseArguments() -> argparse.Namespace:
             "semantic close-ad detection remains available when this XPath changes."
         ),
     )
+    parser.add_argument(
+        "--adInterruptionRecoveryRestartSeconds",
+        type=float,
+        default=40.0,
+        help=(
+            "Observed-time policy for restarting the current browser lifecycle when ad-interruption close recovery "
+            "keeps cycling without reaching a pack-ready or reward-confirmation state. Keep the default to match "
+            "the requested forty-second operational boundary; tune this value instead of editing control-flow code."
+        ),
+    )
     return parser.parse_args()
 
 
 def ensureArgumentsAreValid(arguments: argparse.Namespace) -> None:
     if arguments.drawCount is not None and arguments.drawCount < 1:
         raise ValueError("--drawCount 必須大於 0。")
+    if arguments.adInterruptionRecoveryRestartSeconds <= 0:
+        raise ValueError("--adInterruptionRecoveryRestartSeconds 必須大於 0。")
 
 
 def formatDrawProgress(drawIndex: int, drawCount: int | None) -> str:
@@ -1239,6 +1260,115 @@ def saveErrorEvidence(
         },
     )
     persistEvidencePayload(page, evidencePath, errorPayload)
+
+
+adaptiveAdInterruptionRecoveryState: dict[str, Any] = {}
+
+
+def resetAdaptiveAdInterruptionRecoveryState(reason: str | None = None) -> None:
+    adaptiveAdInterruptionRecoveryState.clear()
+    if reason:
+        adaptiveAdInterruptionRecoveryState["lastResetReason"] = reason
+
+
+def summarizeAdInterruptionResolutionForRestart(resolution: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "targetScope": resolution.get("targetScope", "page"),
+        "selector": resolution.get("selector", ""),
+        "frameIndex": resolution.get("frameIndex"),
+        "frameName": resolution.get("frameName"),
+        "frameUrlHash": buildShortHash(str(resolution.get("frameUrl", ""))),
+        "selected": resolution.get("selected"),
+        "reason": resolution.get("reason"),
+    }
+
+
+def buildAdInterruptionRestartEvidence(
+    page: Page,
+    drawIndex: int,
+    adInterruptionResolution: dict[str, Any],
+    adInterruptionClickPayload: dict[str, Any],
+) -> dict[str, Any]:
+    renderedStateFingerprint = getRenderedStateFingerprint(page)
+    return {
+        "drawIndex": drawIndex,
+        "url": page.url,
+        "adInterruptionResolutionFingerprint": buildResolutionFingerprint(adInterruptionResolution),
+        "adInterruptionResolutionSummary": summarizeAdInterruptionResolutionForRestart(adInterruptionResolution),
+        "clickStateChanged": adInterruptionClickPayload.get("stateChanged"),
+        "pageFingerprintChanged": adInterruptionClickPayload.get("pageFingerprintChanged"),
+        "renderedStateChanged": adInterruptionClickPayload.get("renderedStateChanged"),
+        "currentFingerprintHash": adInterruptionClickPayload.get("currentFingerprintHash"),
+        "currentRenderedStateFingerprintHash": buildShortHash(renderedStateFingerprint),
+        "renderObservation": adInterruptionClickPayload.get("renderObservation"),
+    }
+
+
+def recordAdInterruptionRecoveryAndRestartIfStalled(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    adInterruptionResolution: dict[str, Any],
+    adInterruptionClickPayload: dict[str, Any],
+) -> None:
+    nowMonotonicSeconds = time.monotonic()
+    eventSummary = buildAdInterruptionRestartEvidence(
+        page,
+        drawIndex,
+        adInterruptionResolution,
+        adInterruptionClickPayload,
+    )
+
+    currentDrawIndex = adaptiveAdInterruptionRecoveryState.get("drawIndex")
+    if currentDrawIndex != drawIndex or "startedAtMonotonicSeconds" not in adaptiveAdInterruptionRecoveryState:
+        adaptiveAdInterruptionRecoveryState.clear()
+        adaptiveAdInterruptionRecoveryState.update(
+            {
+                "drawIndex": drawIndex,
+                "startedAtMonotonicSeconds": nowMonotonicSeconds,
+                "startedAtUtc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                "events": [],
+            }
+        )
+
+    recoveryEvents = adaptiveAdInterruptionRecoveryState.setdefault("events", [])
+    eventSummary["eventIndex"] = len(recoveryEvents) + 1
+    eventSummary["elapsedRecoverySeconds"] = nowMonotonicSeconds - adaptiveAdInterruptionRecoveryState["startedAtMonotonicSeconds"]
+    recoveryEvents.append(eventSummary)
+
+    elapsedRecoverySeconds = eventSummary["elapsedRecoverySeconds"]
+    hasRepeatedAdInterruptionClose = len(recoveryEvents) > 1
+    shouldRestartLifecycle = (
+        hasRepeatedAdInterruptionClose
+        and elapsedRecoverySeconds >= arguments.adInterruptionRecoveryRestartSeconds
+    )
+    if not shouldRestartLifecycle:
+        return
+
+    restartPayload = {
+        "reason": (
+            "Ad-interruption close recovery kept cycling without reaching a pack-ready or reward-confirmation state; "
+            "the current page will be closed and a fresh browser lifecycle will be started."
+        ),
+        "drawIndex": drawIndex,
+        "elapsedRecoverySeconds": elapsedRecoverySeconds,
+        "adInterruptionRecoveryRestartSeconds": arguments.adInterruptionRecoveryRestartSeconds,
+        "recoveryEventCount": len(recoveryEvents),
+        "recoveryEvents": recoveryEvents,
+        "latestEvent": eventSummary,
+        "drawRunMode": getDrawRunMode(arguments),
+        "url": arguments.url,
+        "profileDir": arguments.profileDir,
+    }
+    payload = buildEvidencePayload(
+        page,
+        f"draw_{drawIndex:03d}_ad_interruption_recovery_restart_requested",
+        restartPayload,
+    )
+    evidenceEventTrail.append(summarizeEvidenceEvent(payload))
+    persistEvidencePayload(page, evidencePath, payload)
+    raise BrowserLifecycleRestartRequired(restartPayload["reason"])
 
 def resolveRemainingPackCount(
     page: Page,
@@ -3593,6 +3723,14 @@ def recoverFromAdInterruptionIfPresent(
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_interruption_closed", adInterruptionClickPayload)
     waitForRenderCycle(page)
+    recordAdInterruptionRecoveryAndRestartIfStalled(
+        page,
+        evidencePath,
+        arguments,
+        drawIndex,
+        adInterruptionResolution,
+        adInterruptionClickPayload,
+    )
     print("[INFO] Ad-interruption dialog was closed; resuming adaptive recovery.")
     return True
 
@@ -3646,6 +3784,7 @@ def recoverFromInsufficientPackIfPresent(
         "packTargetBecameAvailable",
         "insufficientPackRecoveryStillAvailable",
     }:
+        resetAdaptiveAdInterruptionRecoveryState("adRecoveryReturnedControlToPackPage")
         print("[INFO] Ad recovery returned control to the pack page; resuming pack opening.")
         return True
 
@@ -3675,6 +3814,7 @@ def recoverFromInsufficientPackIfPresent(
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_reward_confirmation_clicked", confirmationClickPayload)
     waitForRenderCycle(page)
+    resetAdaptiveAdInterruptionRecoveryState("insufficientPackRecoveryFlowCompleted")
     print("[INFO] Insufficient-pack recovery flow completed; resuming pack opening.")
     return True
 
@@ -3706,6 +3846,7 @@ def clickAdRewardConfirmationIfPresent(
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_ad_reward_confirmation_clicked", confirmationClickPayload)
     waitForRenderCycle(page)
+    resetAdaptiveAdInterruptionRecoveryState("adRewardConfirmationClicked")
     print("[INFO] Ad-reward confirmation was clicked; resuming adaptive recovery.")
     return True
 
@@ -3752,6 +3893,7 @@ def recoverFromExpectedAdRecoveryOutcome(
         "packTargetBecameAvailable",
         "insufficientPackRecoveryStillAvailable",
     }:
+        resetAdaptiveAdInterruptionRecoveryState("deferredAdRecoveryReturnedControlToPackPage")
         print("[INFO] Deferred ad recovery returned control to the pack page; resuming pack opening.")
         return True
 
@@ -3827,6 +3969,7 @@ def completePackOpening(
                     "Return-to-pack-page button was clicked, but neither DOM nor rendered page state changed. "
                     "Inspect the return target evidence JSON/screenshot."
                 )
+            resetAdaptiveAdInterruptionRecoveryState("returnedToPackPage")
             saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
             return True
 
@@ -3924,6 +4067,7 @@ def completePackOpening(
                         "Result-page draw targets were suppressed and the return-to-pack button was clicked, "
                         "but neither DOM nor rendered page state changed."
                     )
+                resetAdaptiveAdInterruptionRecoveryState("returnedToPackPage")
                 saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
                 return True
 
@@ -3982,6 +4126,7 @@ def completePackOpening(
                         "A stale or already-consumed continuation target produced no state change; "
                         "a return-to-pack button was found, but clicking it also produced no state change."
                     )
+                resetAdaptiveAdInterruptionRecoveryState("returnedToPackPage")
                 saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
                 return True
 
@@ -3994,6 +4139,7 @@ def completePackOpening(
                 "result-page controls or found no unrevealed pack target. Inspect clickAttempts, refreshResolutionFailure, "
                 "refreshedTargetResolutionAfterNoChange, and returnResolutionAfterNoChange evidence."
             )
+        resetAdaptiveAdInterruptionRecoveryState("packOpeningTargetAdvanced")
         saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_result", progressPayload)
 
 def recoverFromPossibleEntryGate(page: Page, evidencePath: Path, rememberDismissal: bool) -> list[dict[str, Any]]:
@@ -4129,6 +4275,7 @@ def runExternalGoogleSignInSetup(arguments: argparse.Namespace, profilePath: Pat
 
 
 def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) -> None:
+    resetAdaptiveAdInterruptionRecoveryState("performDrawsStarted")
     page.goto(arguments.url, wait_until="domcontentloaded", timeout=0)
     waitForPageReady(page)
     dismissedGates = dismissEntryGates(page, evidencePath, rememberDismissal=not arguments.keepEntryNotices)
@@ -4394,6 +4541,157 @@ def launchPersistentContext(playwright: Any, arguments: argparse.Namespace, prof
     return context
 
 
+def isBrowserLifecycleClosedError(error: BaseException) -> bool:
+    errorText = " ".join(
+        [
+            type(error).__name__,
+            str(error),
+            repr(error),
+        ]
+    ).lower()
+    browserClosedSignals = (
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "browser closed",
+        "target closed",
+        "page closed",
+        "context closed",
+        "browser disconnected",
+        "connection closed",
+        "connection terminated",
+        "transport closed",
+        "websocket closed",
+        "socket is closed",
+        "closed before",
+        "object has been collected",
+    )
+    return isinstance(error, PlaywrightError) and any(signal in errorText for signal in browserClosedSignals)
+
+
+def closePageQuietly(page: Page | None) -> None:
+    if page is None or page.is_closed():
+        return
+    try:
+        page.close(run_before_unload=False)
+    except PlaywrightError as error:
+        if not isBrowserLifecycleClosedError(error):
+            print(
+                f"[WARN] Browser page close raised {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+
+
+def closeContextQuietly(context: BrowserContext | None) -> None:
+    if context is None:
+        return
+    try:
+        context.close()
+    except PlaywrightError as error:
+        if not isBrowserLifecycleClosedError(error):
+            print(
+                f"[WARN] Browser context close raised {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+
+
+def saveErrorEvidenceIfPossible(
+    page: Page | None,
+    evidencePath: Path,
+    error: BaseException,
+    arguments: argparse.Namespace,
+) -> None:
+    if page is None or page.is_closed():
+        return
+    try:
+        saveErrorEvidence(page, evidencePath, error, arguments)
+    except Exception as evidenceError:
+        print(
+            "[WARN] Failed to persist error evidence: "
+            f"{type(evidenceError).__name__}: {evidenceError}",
+            file=sys.stderr,
+        )
+
+
+def waitForBotLifecycleClosure(page: Page | None, context: BrowserContext | None) -> None:
+    if page is not None and not page.is_closed():
+        print("[INFO] Bot lifecycle completed; keeping the supervisor alive until the browser is closed or Ctrl+C is pressed.")
+        try:
+            page.wait_for_event("close", timeout=0)
+            return
+        except PlaywrightError as error:
+            if isBrowserLifecycleClosedError(error):
+                return
+            raise
+    if context is not None:
+        print("[INFO] Bot lifecycle completed; waiting for the browser context to close or Ctrl+C.")
+        try:
+            context.wait_for_event("close", timeout=0)
+            return
+        except PlaywrightError as error:
+            if isBrowserLifecycleClosedError(error):
+                return
+            raise
+
+
+def runBotLifecycle(
+    playwright: Any,
+    arguments: argparse.Namespace,
+    profilePath: Path,
+    evidencePath: Path,
+    botLifecycleIndex: int,
+) -> bool:
+    context: BrowserContext | None = None
+    page: Page | None = None
+    resetEvidenceEventTrail()
+    print(f"[INFO] Starting Bot lifecycle #{botLifecycleIndex} from a fresh browser context.")
+    try:
+        context = launchPersistentContext(playwright, arguments, profilePath)
+        page = context.pages[0] if context.pages else context.new_page()
+        performDraws(page, arguments, evidencePath)
+        if arguments.drawCount is not None:
+            return False
+        waitForBotLifecycleClosure(page, context)
+        return True
+    except KeyboardInterrupt:
+        raise
+    except BrowserLifecycleRestartRequired as restartRequest:
+        print(
+            "[WARN] Adaptive ad-interruption recovery requested a browser lifecycle restart: "
+            f"{restartRequest}",
+            file=sys.stderr,
+        )
+        closePageQuietly(page)
+        return True
+    except Exception as error:
+        if isBrowserLifecycleClosedError(error):
+            print(
+                "[WARN] Bot lifecycle browser/page/context was closed unexpectedly; "
+                "starting a new lifecycle from the beginning.",
+                file=sys.stderr,
+            )
+            return True
+        saveErrorEvidenceIfPossible(page, evidencePath, error, arguments)
+        raise
+    finally:
+        closeContextQuietly(context)
+
+
+def runSupervisedBotMode(arguments: argparse.Namespace, profilePath: Path, evidencePath: Path) -> int:
+    botLifecycleIndex = 1
+    with sync_playwright() as playwright:
+        while True:
+            shouldRestartLifecycle = runBotLifecycle(
+                playwright,
+                arguments,
+                profilePath,
+                evidencePath,
+                botLifecycleIndex,
+            )
+            if not shouldRestartLifecycle:
+                return 0
+            botLifecycleIndex += 1
+
+
 def main() -> int:
     arguments = parseArguments()
     ensureArgumentsAreValid(arguments)
@@ -4416,25 +4714,7 @@ def main() -> int:
         runExternalManualMode(arguments, profilePath)
         return 0
 
-    with sync_playwright() as playwright:
-        context = launchPersistentContext(playwright, arguments, profilePath)
-        page = context.pages[0] if context.pages else context.new_page()
-        try:
-            performDraws(page, arguments, evidencePath)
-        except Exception as error:
-            try:
-                saveErrorEvidence(page, evidencePath, error, arguments)
-            except Exception as evidenceError:
-                print(
-                    "[WARN] Failed to persist error evidence: "
-                    f"{type(evidenceError).__name__}: {evidenceError}",
-                    file=sys.stderr,
-                )
-            raise
-        finally:
-            context.close()
-
-    return 0
+    return runSupervisedBotMode(arguments, profilePath, evidencePath)
 
 
 if __name__ == "__main__":
