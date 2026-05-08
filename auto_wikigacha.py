@@ -27,6 +27,15 @@ class WikiGachaAutomationError(RuntimeError):
     pass
 
 
+saveRoutineEvidence = False
+evidenceEventTrail: list[dict[str, Any]] = []
+
+
+def setRoutineEvidenceEnabled(enabled: bool) -> None:
+    global saveRoutineEvidence
+    saveRoutineEvidence = enabled
+
+
 def parseArguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -54,6 +63,14 @@ def parseArguments() -> argparse.Namespace:
         "--evidenceDir",
         default="wikigacha_results",
         help="Directory for screenshots and non-secret state reports.",
+    )
+    parser.add_argument(
+        "--saveRoutineEvidence",
+        action="store_true",
+        help=(
+            "Persist routine screenshots and non-secret reports during normal operation. "
+            "By default, evidence files are written only when an error occurs."
+        ),
     )
     parser.add_argument(
         "--headed",
@@ -158,11 +175,11 @@ def getDrawRunMode(arguments: argparse.Namespace) -> str:
     return "boundedDrawCountWithRemainingPackGuard"
 
 
-def createEvidenceDirectory(evidenceDir: str) -> Path:
+def createEvidenceDirectory(evidenceDir: str, shouldCreateImmediately: bool = False) -> Path:
     evidencePath = Path(evidenceDir)
-    evidencePath.mkdir(parents=True, exist_ok=True)
+    if shouldCreateImmediately:
+        evidencePath.mkdir(parents=True, exist_ok=True)
     return evidencePath
-
 
 def buildShortHash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
@@ -1072,25 +1089,87 @@ def collectNonSecretStorageSummary(page: Page) -> dict[str, Any]:
     )
 
 
-def saveEvidence(page: Page, evidencePath: Path, label: str, extraPayload: dict[str, Any]) -> None:
+def buildEvidencePayload(page: Page, label: str, extraPayload: dict[str, Any]) -> dict[str, Any]:
     timestampText = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    screenshotPath = evidencePath / f"{timestampText}_{label}.png"
-    reportPath = evidencePath / f"{timestampText}_{label}.json"
-    page.screenshot(path=str(screenshotPath), full_page=True)
-    storageSummary = collectNonSecretStorageSummary(page)
-    payload = {
+    return {
         "createdAtUtc": timestampText,
         "label": label,
         "url": page.url,
-        "storageSummary": storageSummary,
+        "storageSummary": collectNonSecretStorageSummary(page),
         "extra": extraPayload,
     }
+
+
+def persistEvidencePayload(
+    page: Page,
+    evidencePath: Path,
+    payload: dict[str, Any],
+    screenshotLabel: str | None = None,
+) -> tuple[Path, Path]:
+    evidencePath.mkdir(parents=True, exist_ok=True)
+    timestampText = payload.get("createdAtUtc") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    label = screenshotLabel or str(payload.get("label") or "evidence")
+    screenshotPath = evidencePath / f"{timestampText}_{label}.png"
+    reportPath = evidencePath / f"{timestampText}_{label}.json"
+    page.screenshot(path=str(screenshotPath), full_page=True)
     writeJson(reportPath, payload)
     print(f"[INFO] Saved screenshot: {screenshotPath}")
     print(f"[INFO] Saved non-secret report: {reportPath}")
+    return screenshotPath, reportPath
 
 
+def summarizeEvidenceEvent(payload: dict[str, Any]) -> dict[str, Any]:
+    extraPayload = payload.get("extra", {})
+    serializedExtraPayload = json.dumps(extraPayload, ensure_ascii=False, sort_keys=True, default=str)
+    return {
+        "createdAtUtc": payload.get("createdAtUtc"),
+        "label": payload.get("label"),
+        "url": payload.get("url"),
+        "extraPayloadHash": buildShortHash(serializedExtraPayload),
+        "extraPayloadKeys": sorted(extraPayload.keys()) if isinstance(extraPayload, dict) else [],
+    }
 
+
+def saveEvidence(page: Page, evidencePath: Path, label: str, extraPayload: dict[str, Any]) -> None:
+    if not saveRoutineEvidence:
+        timestampText = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        serializedExtraPayload = json.dumps(extraPayload, ensure_ascii=False, sort_keys=True, default=str)
+        evidenceEventTrail.append(
+            {
+                "createdAtUtc": timestampText,
+                "label": label,
+                "url": page.url,
+                "extraPayloadHash": buildShortHash(serializedExtraPayload),
+                "extraPayloadKeys": sorted(extraPayload.keys()) if isinstance(extraPayload, dict) else [],
+            }
+        )
+        return
+
+    payload = buildEvidencePayload(page, label, extraPayload)
+    evidenceEventTrail.append(summarizeEvidenceEvent(payload))
+    persistEvidencePayload(page, evidencePath, payload)
+
+
+def saveErrorEvidence(
+    page: Page,
+    evidencePath: Path,
+    error: BaseException,
+    arguments: argparse.Namespace,
+) -> None:
+    errorPayload = buildEvidencePayload(
+        page,
+        "error",
+        {
+            "errorType": type(error).__name__,
+            "errorMessage": str(error),
+            "drawRunMode": getDrawRunMode(arguments),
+            "url": arguments.url,
+            "profileDir": arguments.profileDir,
+            "routineEvidencePersisted": saveRoutineEvidence,
+            "evidenceEventTrail": evidenceEventTrail,
+        },
+    )
+    persistEvidencePayload(page, evidencePath, errorPayload)
 
 def resolveRemainingPackCount(
     page: Page,
@@ -2249,6 +2328,362 @@ def waitForAdRewardConfirmationTarget(page: Page, adRewardConfirmButtonXPathValu
     )
 
 
+def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
+    return page.evaluate(
+        r"""
+        () => {
+            const markerPrefix = `auto-wikigacha-ad-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const actionableSelector = [
+                'button',
+                'a[href]',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]'
+            ].join(',');
+            const adInterruptionPatterns = [
+                /贊助鏈接|赞助链接|sponsored\s*link/iu,
+                /Monetag/iu,
+                /廣告已暫時停用|广告已暂时停用/iu,
+                /廣告.*暫時.*停用|广告.*暂时.*停用/iu,
+                /ad(?:vertisement)?\s*(?:temporarily\s*)?(?:disabled|unavailable|paused|suspended)/iu,
+                /請稍候|请稍候|please\s*wait/iu,
+            ];
+            const closeActionPatterns = [
+                /^(?:關閉廣告|关闭广告|關閉|关闭|關掉|關閉視窗|关闭窗口)$/iu,
+                /^(?:close\s*(?:ad|advertisement)?|dismiss)$/iu,
+                /^(?:広告を閉じる|閉じる)$/iu,
+                /(?:關閉|关闭|close|dismiss).*(?:廣告|广告|ad|advertisement)/iu,
+                /(?:廣告|广告|ad|advertisement).*(?:關閉|关闭|close|dismiss)/iu,
+            ];
+            const negativeActionPatterns = [
+                /圖鑑|图鉴|図鑑/iu,
+                /對戰|对战|battle|バトル/iu,
+                /獎盃|奖杯|trophy/iu,
+                /遊戲說明|游戏说明|help|rule/iu,
+                /privacy|policy|terms|contact/iu,
+                /隱私|隐私|條款|条款|聯絡|联系/iu,
+            ];
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+            const getElementText = (element) => {
+                if (!element) {
+                    return '';
+                }
+                return normalizeWhitespace([
+                    element.innerText,
+                    element.textContent,
+                    element.getAttribute ? element.getAttribute('aria-label') : '',
+                    element.getAttribute ? element.getAttribute('title') : '',
+                    element.getAttribute ? element.getAttribute('value') : '',
+                    element.id,
+                    getClassText(element),
+                    ...Array.from(element.querySelectorAll ? element.querySelectorAll('img[alt]') : [])
+                        .map((image) => image.getAttribute('alt')),
+                ].filter(Boolean).join(' '));
+            };
+            const isVisible = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && !element.hasAttribute('disabled')
+                    && element.getAttribute('aria-disabled') !== 'true';
+            };
+            const isPointerReceivable = (element) => {
+                const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+                const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
+                return targetRectangles.some((rect) => {
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    const hitElement = document.elementFromPoint(centerX, centerY);
+                    return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
+                });
+            };
+            const getEvidenceCount = (patterns, text) => patterns
+                .map((pattern) => pattern.test(text))
+                .filter(Boolean)
+                .length;
+            const findAdInterruptionRoot = () => {
+                const visibleElements = Array.from(document.querySelectorAll('body *'))
+                    .filter((element) => element instanceof HTMLElement)
+                    .filter(isVisible);
+                const roots = visibleElements
+                    .map((element) => {
+                        const text = getElementText(element);
+                        const adInterruptionEvidence = getEvidenceCount(adInterruptionPatterns, text);
+                        const closeActionEvidence = Array.from(element.querySelectorAll(actionableSelector))
+                            .filter((action) => action instanceof HTMLElement)
+                            .filter(isVisible)
+                            .map((action) => getEvidenceCount(closeActionPatterns, getElementText(action)))
+                            .reduce((total, evidence) => total + evidence, 0);
+                        const rect = element.getBoundingClientRect();
+                        const style = window.getComputedStyle(element);
+                        return {
+                            element,
+                            text,
+                            adInterruptionEvidence,
+                            closeActionEvidence,
+                            area: rect.width * rect.height,
+                            top: rect.top,
+                            left: rect.left,
+                            position: style.position,
+                            zIndex: style.zIndex,
+                        };
+                    })
+                    .filter((candidate) => candidate.adInterruptionEvidence > 0)
+                    .filter((candidate) => candidate.closeActionEvidence > 0)
+                    .sort((left, right) => {
+                        const comparisons = [
+                            right.adInterruptionEvidence - left.adInterruptionEvidence,
+                            right.closeActionEvidence - left.closeActionEvidence,
+                            left.area - right.area,
+                            right.top - left.top,
+                            left.left - right.left,
+                        ];
+                        return comparisons.find((comparison) => comparison !== 0) || 0;
+                    });
+                return roots.length > 0 ? roots[0] : null;
+            };
+            const summarizeAction = (element, source, root) => {
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+                return {
+                    source,
+                    text: getElementText(element).slice(0, 260),
+                    rootText: root ? root.text.slice(0, 520) : '',
+                    tagName: element.tagName.toLowerCase(),
+                    role: element.getAttribute('role') || '',
+                    id: element.id || '',
+                    className: getClassText(element).slice(0, 260),
+                    pointerReceivable: isPointerReceivable(element),
+                    cursor: style.cursor,
+                    area: rect.width * rect.height,
+                    top: rect.top,
+                    left: rect.left,
+                };
+            };
+
+            const adInterruptionRoot = findAdInterruptionRoot();
+            if (!adInterruptionRoot) {
+                return {
+                    ok: false,
+                    reason: 'No visible ad-interruption dialog with a close-ad action was detected.',
+                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
+                };
+            }
+
+            const candidates = Array.from(adInterruptionRoot.element.querySelectorAll(actionableSelector))
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isVisible)
+                .map((element, index) => {
+                    const text = getElementText(element);
+                    const rect = element.getBoundingClientRect();
+                    return {
+                        element,
+                        marker: `${markerPrefix}-${index}`,
+                        closeActionEvidence: getEvidenceCount(closeActionPatterns, text),
+                        negativeActionEvidence: getEvidenceCount(negativeActionPatterns, text),
+                        pointerReceivable: isPointerReceivable(element),
+                        area: rect.width * rect.height,
+                        top: rect.top,
+                        left: rect.left,
+                    };
+                })
+                .filter((candidate) => candidate.closeActionEvidence > 0)
+                .filter((candidate) => candidate.negativeActionEvidence === 0)
+                .sort((left, right) => {
+                    const comparisons = [
+                        right.closeActionEvidence - left.closeActionEvidence,
+                        Number(right.pointerReceivable) - Number(left.pointerReceivable),
+                        right.area - left.area,
+                        right.top - left.top,
+                        left.left - right.left,
+                    ];
+                    return comparisons.find((comparison) => comparison !== 0) || 0;
+                });
+
+            if (candidates.length === 0) {
+                return {
+                    ok: false,
+                    reason: 'An ad-interruption dialog was detected, but no close-ad action was resolved.',
+                    root: {
+                        text: adInterruptionRoot.text.slice(0, 520),
+                        adInterruptionEvidence: adInterruptionRoot.adInterruptionEvidence,
+                        closeActionEvidence: adInterruptionRoot.closeActionEvidence,
+                    },
+                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
+                };
+            }
+
+            const selectedCandidate = candidates[0];
+            selectedCandidate.element.setAttribute('data-auto-wikigacha-ad-close', selectedCandidate.marker);
+            return {
+                ok: true,
+                selector: `[data-auto-wikigacha-ad-close="${selectedCandidate.marker}"]`,
+                selected: summarizeAction(selectedCandidate.element, 'semanticAdInterruptionCloseAction', adInterruptionRoot),
+                candidates: candidates.map((candidate) => summarizeAction(candidate.element, 'semanticAdInterruptionCloseAction', adInterruptionRoot)),
+            };
+        }
+        """
+    )
+
+
+def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: str) -> None:
+    page.wait_for_function(
+        r"""
+        (adRewardConfirmButtonXPathValue) => {
+            const actionableSelector = [
+                'button',
+                'a[href]',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]'
+            ].join(',');
+            const rewardConfirmationPatterns = [
+                /^(?:確定|確認|關閉|關掉|領取|獲得|取得|完成|繼續|開始|好|OK)$/iu,
+                /^(?:确定|确认|关闭|领取|获得|取得|完成|继续|开始|好|OK)$/iu,
+                /(?:claim|collect|get|receive|close|continue|done|confirm|ok|reward)/iu,
+                /^(?:閉じる|確認|受け取る|獲得|取得|完了|続ける|OK)$/iu,
+            ];
+            const adInterruptionPatterns = [
+                /贊助鏈接|赞助链接|sponsored\s*link/iu,
+                /Monetag/iu,
+                /廣告已暫時停用|广告已暂时停用/iu,
+                /廣告.*暫時.*停用|广告.*暂时.*停用/iu,
+                /ad(?:vertisement)?\s*(?:temporarily\s*)?(?:disabled|unavailable|paused|suspended)/iu,
+                /請稍候|请稍候|please\s*wait/iu,
+            ];
+            const adCloseActionPatterns = [
+                /^(?:關閉廣告|关闭广告|關閉|关闭|關掉|關閉視窗|关闭窗口)$/iu,
+                /^(?:close\s*(?:ad|advertisement)?|dismiss)$/iu,
+                /^(?:広告を閉じる|閉じる)$/iu,
+                /(?:關閉|关闭|close|dismiss).*(?:廣告|广告|ad|advertisement)/iu,
+                /(?:廣告|广告|ad|advertisement).*(?:關閉|关闭|close|dismiss)/iu,
+            ];
+            const negativePatterns = [
+                /圖鑑|图鉴|図鑑/iu,
+                /對戰|对战|battle|バトル/iu,
+                /獎盃|奖杯|trophy/iu,
+                /遊戲說明|游戏说明|help|rule/iu,
+                /privacy|policy|terms|contact/iu,
+                /隱私|隐私|條款|条款|聯絡|联系/iu,
+            ];
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+            const getElementText = (element) => {
+                if (!element) {
+                    return '';
+                }
+                return normalizeWhitespace([
+                    element.innerText,
+                    element.textContent,
+                    element.getAttribute ? element.getAttribute('aria-label') : '',
+                    element.getAttribute ? element.getAttribute('title') : '',
+                    element.getAttribute ? element.getAttribute('value') : '',
+                    element.id,
+                    getClassText(element),
+                ].filter(Boolean).join(' '));
+            };
+            const isVisible = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && !element.hasAttribute('disabled')
+                    && element.getAttribute('aria-disabled') !== 'true';
+            };
+            const isPointerReceivable = (element) => {
+                const rect = element.getBoundingClientRect();
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                const hitElement = document.elementFromPoint(centerX, centerY);
+                return Boolean(hitElement && (element === hitElement || element.contains(hitElement)));
+            };
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
+            const bodyText = document.body ? getElementText(document.body) : '';
+            const hasAdInterruptionDialog = adInterruptionPatterns.some((pattern) => pattern.test(bodyText));
+            if (hasAdInterruptionDialog) {
+                const hasAdCloseAction = Array.from(document.querySelectorAll(actionableSelector))
+                    .filter((element) => element instanceof HTMLElement)
+                    .filter(isVisible)
+                    .filter(isPointerReceivable)
+                    .some((element) => {
+                        const text = getElementText(element);
+                        return adCloseActionPatterns.some((pattern) => pattern.test(text))
+                            && !negativePatterns.some((pattern) => pattern.test(text));
+                    });
+                if (hasAdCloseAction) {
+                    return true;
+                }
+            }
+            const configuredButton = resolveXPathElement(adRewardConfirmButtonXPathValue);
+            if (configuredButton instanceof HTMLElement && isVisible(configuredButton) && isPointerReceivable(configuredButton)) {
+                return true;
+            }
+            return Array.from(document.querySelectorAll(actionableSelector))
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isVisible)
+                .filter(isPointerReceivable)
+                .some((element) => {
+                    const text = getElementText(element);
+                    return rewardConfirmationPatterns.some((pattern) => pattern.test(text))
+                        && !negativePatterns.some((pattern) => pattern.test(text));
+                });
+        }
+        """,
+        arg=adRewardConfirmButtonXPathValue,
+        timeout=0,
+    )
+
+
+def recoverFromAdInterruptionIfPresent(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+) -> bool:
+    adInterruptionResolution = resolveAdInterruptionCloseSelector(page)
+    if not adInterruptionResolution.get("ok"):
+        return False
+
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_interruption_close_target", adInterruptionResolution)
+    if arguments.dryRun:
+        print("[DRY-RUN] Ad-interruption close target resolved; close click skipped.")
+        return True
+
+    adInterruptionClickPayload = {
+        "adInterruptionResolution": adInterruptionResolution,
+        **clickResolvedSelectorAndWait(
+            page,
+            adInterruptionResolution["selector"],
+            lambda: resolveAdInterruptionCloseSelector(page),
+        ),
+    }
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_interruption_closed", adInterruptionClickPayload)
+    waitForRenderCycle(page)
+    print("[INFO] Ad-interruption dialog was closed; resuming adaptive recovery.")
+    return True
+
+
 def recoverFromInsufficientPackIfPresent(
     page: Page,
     evidencePath: Path,
@@ -2282,7 +2717,11 @@ def recoverFromInsufficientPackIfPresent(
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_insufficient_pack_recovery_clicked", recoveryClickPayload)
 
-    waitForAdRewardConfirmationTarget(page, arguments.adRewardConfirmButtonXPath)
+    waitForAdRecoveryOutcomeTarget(page, arguments.adRewardConfirmButtonXPath)
+
+    if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
+        return True
+
     confirmationResolution = resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath)
     if not confirmationResolution.get("ok"):
         saveEvidence(
@@ -2323,6 +2762,13 @@ def completePackOpening(
     hasClickedOpeningTarget = False
 
     while True:
+        if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
+            if arguments.dryRun:
+                return True
+            seenOpeningStateHashes.clear()
+            waitForRenderCycle(page)
+            continue
+
         if recoverFromInsufficientPackIfPresent(page, evidencePath, arguments, drawIndex):
             if arguments.dryRun:
                 return True
@@ -2390,6 +2836,14 @@ def completePackOpening(
                 targetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
 
         if not targetResolution.get("ok"):
+            recoveredAdInterruption = recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex)
+            if recoveredAdInterruption:
+                if arguments.dryRun:
+                    return True
+                seenOpeningStateHashes.clear()
+                waitForRenderCycle(page)
+                continue
+
             refreshedReturnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
             if refreshedReturnResolution.get("ok"):
                 saveEvidence(
@@ -2557,6 +3011,38 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
         )
 
         if remainingPacksBeforeDraw is False:
+            recoveredAdInterruption = recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex)
+            if recoveredAdInterruption:
+                if arguments.dryRun:
+                    saveEvidence(
+                        page,
+                        evidencePath,
+                        "dry_run_completed_after_ad_interruption_close_resolution",
+                        {
+                            "completedDrawCount": completedDrawCount,
+                            "nextDrawIndex": drawIndex,
+                            "drawRunMode": getDrawRunMode(arguments),
+                            "remainingPackResolution": remainingPackResolutionBeforeDraw,
+                        },
+                    )
+                    break
+                remainingPackResolutionBeforeDraw = resolveRemainingPackCount(
+                    page,
+                    arguments.remainingPackCountXPath,
+                    arguments.insufficientPackHeadingXPath,
+                )
+                remainingPacksBeforeDraw = hasRemainingPacks(remainingPackResolutionBeforeDraw)
+                saveEvidence(
+                    page,
+                    evidencePath,
+                    f"draw_{drawIndex:03d}_remaining_pack_count_after_ad_interruption_close",
+                    {
+                        "completedDrawCount": completedDrawCount,
+                        "drawRunMode": getDrawRunMode(arguments),
+                        "remainingPackResolution": remainingPackResolutionBeforeDraw,
+                    },
+                )
+
             recoveredInsufficientPack = recoverFromInsufficientPackIfPresent(page, evidencePath, arguments, drawIndex)
             if recoveredInsufficientPack:
                 if arguments.dryRun:
@@ -2593,18 +3079,25 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
                 saveEvidence(
                     page,
                     evidencePath,
-                    "remaining_pack_count_exhausted",
+                    "remaining_pack_counter_zero_before_ui_probe",
                     {
                         "completedDrawCount": completedDrawCount,
                         "nextDrawIndex": drawIndex,
                         "drawRunMode": getDrawRunMode(arguments),
                         "remainingPackResolution": remainingPackResolutionBeforeDraw,
+                        "reason": (
+                            "The visible remaining-pack counter is zero, but the page itself may still expose "
+                            "a pack target that opens the insufficient-pack recovery flow. The automation will "
+                            "probe that UI path before deciding that the adaptive run is complete."
+                        ),
                     },
                 )
-                print("[INFO] Remaining pack counter reached zero and no adaptive recovery path remained; adaptive run is complete.")
-                break
+                print(
+                    "[INFO] Remaining pack counter is zero; probing the UI for a pack target "
+                    "or ad-recovery path before stopping."
+                )
 
-        allowNoInitialTarget = arguments.drawCount is None and remainingPacksBeforeDraw is not True
+        allowNoInitialTarget = remainingPacksBeforeDraw is not True
         print(
             "[INFO] Opening pack lifecycle for draw "
             f"{formatDrawProgress(drawIndex, arguments.drawCount)} "
@@ -2734,7 +3227,11 @@ def launchPersistentContext(playwright: Any, arguments: argparse.Namespace, prof
 def main() -> int:
     arguments = parseArguments()
     ensureArgumentsAreValid(arguments)
-    evidencePath = createEvidenceDirectory(arguments.evidenceDir)
+    setRoutineEvidenceEnabled(arguments.saveRoutineEvidence)
+    evidencePath = createEvidenceDirectory(
+        arguments.evidenceDir,
+        shouldCreateImmediately=arguments.saveRoutineEvidence,
+    )
     profilePath = Path(arguments.profileDir)
     profilePath.mkdir(parents=True, exist_ok=True)
 
@@ -2746,6 +3243,16 @@ def main() -> int:
                 runSetup(page, arguments.url, evidencePath, rememberDismissal=not arguments.keepEntryNotices)
             else:
                 performDraws(page, arguments, evidencePath)
+        except Exception as error:
+            try:
+                saveErrorEvidence(page, evidencePath, error, arguments)
+            except Exception as evidenceError:
+                print(
+                    "[WARN] Failed to persist error evidence: "
+                    f"{type(evidenceError).__name__}: {evidenceError}",
+                    file=sys.stderr,
+                )
+            raise
         finally:
             context.close()
 
