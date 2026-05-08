@@ -21,6 +21,7 @@ remainingPackCountXPath = "/html/body/main/div/div/div[1]/div[1]/span"
 insufficientPackHeadingXPath = "/html/body/main/div/div/div[1]/div/h2"
 recoverPackButtonXPath = "/html/body/main/div/div/div[1]/div/button"
 adRewardConfirmButtonXPath = "/html/body/main/div/div/div[2]/div/div/div[2]/button"
+adOverlayCloseButtonXPath = "/html/body/div[1]/div[2]/div[4]/div[2]"
 
 
 class WikiGachaAutomationError(RuntimeError):
@@ -153,6 +154,15 @@ def parseArguments() -> argparse.Namespace:
         help=(
             "XPath for the post-ad reward confirmation button. "
             "The resolver waits adaptively for this control and falls back to semantic dialog buttons."
+        ),
+    )
+    parser.add_argument(
+        "--adOverlayCloseButtonXPath",
+        default=adOverlayCloseButtonXPath,
+        help=(
+            "XPath for the rewarded-ad overlay close button. "
+            "The default targets the current Google rewarded overlay's round close button; "
+            "semantic close-ad detection remains available when this XPath changes."
         ),
     )
     return parser.parse_args()
@@ -2328,10 +2338,10 @@ def waitForAdRewardConfirmationTarget(page: Page, adRewardConfirmButtonXPathValu
     )
 
 
-def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
+def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValue: str) -> dict[str, Any]:
     return page.evaluate(
         r"""
-        () => {
+        (adOverlayCloseButtonXPathValue) => {
             const markerPrefix = `auto-wikigacha-ad-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
             const actionableSelector = [
                 'button',
@@ -2347,6 +2357,7 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                 /廣告.*暫時.*停用|广告.*暂时.*停用/iu,
                 /ad(?:vertisement)?\s*(?:temporarily\s*)?(?:disabled|unavailable|paused|suspended)/iu,
                 /請稍候|请稍候|please\s*wait/iu,
+                /#goog_rewarded|goog_rewarded|rewarded\s*ad|google\s*rewarded/iu,
             ];
             const closeActionPatterns = [
                 /^(?:關閉廣告|关闭广告|關閉|关闭|關掉|關閉視窗|关闭窗口)$/iu,
@@ -2354,6 +2365,7 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                 /^(?:広告を閉じる|閉じる)$/iu,
                 /(?:關閉|关闭|close|dismiss).*(?:廣告|广告|ad|advertisement)/iu,
                 /(?:廣告|广告|ad|advertisement).*(?:關閉|关闭|close|dismiss)/iu,
+                /^\s*[×✕✖x]\s*$/iu,
             ];
             const negativeActionPatterns = [
                 /圖鑑|图鉴|図鑑/iu,
@@ -2362,6 +2374,7 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                 /遊戲說明|游戏说明|help|rule/iu,
                 /privacy|policy|terms|contact/iu,
                 /隱私|隐私|條款|条款|聯絡|联系/iu,
+                /瞭解詳情|了解详情|learn\s*more|details/iu,
             ];
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
             const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
@@ -2404,10 +2417,29 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                     return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
                 });
             };
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
             const getEvidenceCount = (patterns, text) => patterns
                 .map((pattern) => pattern.test(text))
                 .filter(Boolean)
                 .length;
+            const buildRootSummary = () => {
+                const bodyText = getElementText(document.body);
+                return {
+                    text: bodyText,
+                    adInterruptionEvidence: getEvidenceCount(adInterruptionPatterns, `${location.href} ${bodyText}`),
+                    closeActionEvidence: 0,
+                    source: 'pageBody',
+                };
+            };
             const findAdInterruptionRoot = () => {
                 const visibleElements = Array.from(document.querySelectorAll('body *'))
                     .filter((element) => element instanceof HTMLElement)
@@ -2415,7 +2447,7 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                 const roots = visibleElements
                     .map((element) => {
                         const text = getElementText(element);
-                        const adInterruptionEvidence = getEvidenceCount(adInterruptionPatterns, text);
+                        const adInterruptionEvidence = getEvidenceCount(adInterruptionPatterns, `${location.href} ${text}`);
                         const closeActionEvidence = Array.from(element.querySelectorAll(actionableSelector))
                             .filter((action) => action instanceof HTMLElement)
                             .filter(isVisible)
@@ -2433,10 +2465,10 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                             left: rect.left,
                             position: style.position,
                             zIndex: style.zIndex,
+                            source: 'semanticAdInterruptionRoot',
                         };
                     })
                     .filter((candidate) => candidate.adInterruptionEvidence > 0)
-                    .filter((candidate) => candidate.closeActionEvidence > 0)
                     .sort((left, right) => {
                         const comparisons = [
                             right.adInterruptionEvidence - left.adInterruptionEvidence,
@@ -2449,7 +2481,7 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                     });
                 return roots.length > 0 ? roots[0] : null;
             };
-            const summarizeAction = (element, source, root) => {
+            const summarizeAction = (element, source, root, evidence) => {
                 const rect = element.getBoundingClientRect();
                 const style = window.getComputedStyle(element);
                 return {
@@ -2460,6 +2492,9 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                     role: element.getAttribute('role') || '',
                     id: element.id || '',
                     className: getClassText(element).slice(0, 260),
+                    configuredXPathEvidence: evidence ? evidence.configuredXPathEvidence : 0,
+                    closeActionEvidence: evidence ? evidence.closeActionEvidence : 0,
+                    negativeActionEvidence: evidence ? evidence.negativeActionEvidence : 0,
                     pointerReceivable: isPointerReceivable(element),
                     cursor: style.cursor,
                     area: rect.width * rect.height,
@@ -2468,36 +2503,56 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
                 };
             };
 
-            const adInterruptionRoot = findAdInterruptionRoot();
-            if (!adInterruptionRoot) {
-                return {
-                    ok: false,
-                    reason: 'No visible ad-interruption dialog with a close-ad action was detected.',
-                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
-                };
+            const configuredCloseButton = resolveXPathElement(adOverlayCloseButtonXPathValue);
+            const adInterruptionRoot = findAdInterruptionRoot() || buildRootSummary();
+            const baseCandidates = [];
+            if (configuredCloseButton instanceof HTMLElement && isVisible(configuredCloseButton)) {
+                baseCandidates.push({
+                    element: configuredCloseButton,
+                    marker: `${markerPrefix}-configured-overlay-close-xpath`,
+                    configuredXPathEvidence: 1,
+                    closeActionEvidence: 1,
+                    negativeActionEvidence: 0,
+                    pointerReceivable: isPointerReceivable(configuredCloseButton),
+                    source: 'configuredAdOverlayCloseButtonXPath',
+                });
             }
 
-            const candidates = Array.from(adInterruptionRoot.element.querySelectorAll(actionableSelector))
-                .filter((element) => element instanceof HTMLElement)
-                .filter(isVisible)
-                .map((element, index) => {
-                    const text = getElementText(element);
-                    const rect = element.getBoundingClientRect();
+            const semanticSearchRoot = adInterruptionRoot && adInterruptionRoot.element ? adInterruptionRoot.element : document;
+            baseCandidates.push(
+                ...Array.from(semanticSearchRoot.querySelectorAll(actionableSelector))
+                    .filter((element) => element instanceof HTMLElement)
+                    .filter(isVisible)
+                    .map((element, index) => {
+                        const text = getElementText(element);
+                        return {
+                            element,
+                            marker: `${markerPrefix}-semantic-${index}`,
+                            configuredXPathEvidence: 0,
+                            closeActionEvidence: getEvidenceCount(closeActionPatterns, text),
+                            negativeActionEvidence: getEvidenceCount(negativeActionPatterns, text),
+                            pointerReceivable: isPointerReceivable(element),
+                            source: 'semanticAdInterruptionCloseAction',
+                        };
+                    })
+            );
+
+            const candidates = baseCandidates
+                .filter((candidate, index, allCandidates) => index === allCandidates.findIndex((other) => other.element === candidate.element))
+                .map((candidate) => {
+                    const rect = candidate.element.getBoundingClientRect();
                     return {
-                        element,
-                        marker: `${markerPrefix}-${index}`,
-                        closeActionEvidence: getEvidenceCount(closeActionPatterns, text),
-                        negativeActionEvidence: getEvidenceCount(negativeActionPatterns, text),
-                        pointerReceivable: isPointerReceivable(element),
+                        ...candidate,
                         area: rect.width * rect.height,
                         top: rect.top,
                         left: rect.left,
                     };
                 })
-                .filter((candidate) => candidate.closeActionEvidence > 0)
+                .filter((candidate) => candidate.configuredXPathEvidence > 0 || candidate.closeActionEvidence > 0)
                 .filter((candidate) => candidate.negativeActionEvidence === 0)
                 .sort((left, right) => {
                     const comparisons = [
+                        right.configuredXPathEvidence - left.configuredXPathEvidence,
                         right.closeActionEvidence - left.closeActionEvidence,
                         Number(right.pointerReceivable) - Number(left.pointerReceivable),
                         right.area - left.area,
@@ -2510,11 +2565,13 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
             if (candidates.length === 0) {
                 return {
                     ok: false,
-                    reason: 'An ad-interruption dialog was detected, but no close-ad action was resolved.',
+                    reason: 'No visible configured or semantic ad close action was resolved.',
+                    adOverlayCloseButtonXPath: adOverlayCloseButtonXPathValue,
+                    configuredCloseButtonVisible: configuredCloseButton instanceof HTMLElement ? isVisible(configuredCloseButton) : false,
                     root: {
-                        text: adInterruptionRoot.text.slice(0, 520),
-                        adInterruptionEvidence: adInterruptionRoot.adInterruptionEvidence,
-                        closeActionEvidence: adInterruptionRoot.closeActionEvidence,
+                        text: adInterruptionRoot ? adInterruptionRoot.text.slice(0, 520) : '',
+                        adInterruptionEvidence: adInterruptionRoot ? adInterruptionRoot.adInterruptionEvidence : 0,
+                        closeActionEvidence: adInterruptionRoot ? adInterruptionRoot.closeActionEvidence : 0,
                     },
                     visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
                 };
@@ -2525,18 +2582,23 @@ def resolveAdInterruptionCloseSelector(page: Page) -> dict[str, Any]:
             return {
                 ok: true,
                 selector: `[data-auto-wikigacha-ad-close="${selectedCandidate.marker}"]`,
-                selected: summarizeAction(selectedCandidate.element, 'semanticAdInterruptionCloseAction', adInterruptionRoot),
-                candidates: candidates.map((candidate) => summarizeAction(candidate.element, 'semanticAdInterruptionCloseAction', adInterruptionRoot)),
+                selected: summarizeAction(selectedCandidate.element, selectedCandidate.source, adInterruptionRoot, selectedCandidate),
+                candidates: candidates.map((candidate) => summarizeAction(candidate.element, candidate.source, adInterruptionRoot, candidate)),
             };
         }
-        """
+        """,
+        adOverlayCloseButtonXPathValue,
     )
 
 
-def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: str) -> None:
+def waitForAdRecoveryOutcomeTarget(
+    page: Page,
+    adRewardConfirmButtonXPathValue: str,
+    adOverlayCloseButtonXPathValue: str,
+) -> None:
     page.wait_for_function(
         r"""
-        (adRewardConfirmButtonXPathValue) => {
+        ({ adRewardConfirmButtonXPathValue, adOverlayCloseButtonXPathValue }) => {
             const actionableSelector = [
                 'button',
                 'a[href]',
@@ -2557,6 +2619,7 @@ def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: 
                 /廣告.*暫時.*停用|广告.*暂时.*停用/iu,
                 /ad(?:vertisement)?\s*(?:temporarily\s*)?(?:disabled|unavailable|paused|suspended)/iu,
                 /請稍候|请稍候|please\s*wait/iu,
+                /#goog_rewarded|goog_rewarded|rewarded\s*ad|google\s*rewarded/iu,
             ];
             const adCloseActionPatterns = [
                 /^(?:關閉廣告|关闭广告|關閉|关闭|關掉|關閉視窗|关闭窗口)$/iu,
@@ -2564,6 +2627,7 @@ def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: 
                 /^(?:広告を閉じる|閉じる)$/iu,
                 /(?:關閉|关闭|close|dismiss).*(?:廣告|广告|ad|advertisement)/iu,
                 /(?:廣告|广告|ad|advertisement).*(?:關閉|关闭|close|dismiss)/iu,
+                /^\s*[×✕✖x]\s*$/iu,
             ];
             const negativePatterns = [
                 /圖鑑|图鉴|図鑑/iu,
@@ -2572,6 +2636,7 @@ def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: 
                 /遊戲說明|游戏说明|help|rule/iu,
                 /privacy|policy|terms|contact/iu,
                 /隱私|隐私|條款|条款|聯絡|联系/iu,
+                /瞭解詳情|了解详情|learn\s*more|details/iu,
             ];
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
             const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
@@ -2603,11 +2668,14 @@ def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: 
                     && element.getAttribute('aria-disabled') !== 'true';
             };
             const isPointerReceivable = (element) => {
-                const rect = element.getBoundingClientRect();
-                const centerX = rect.left + rect.width / 2;
-                const centerY = rect.top + rect.height / 2;
-                const hitElement = document.elementFromPoint(centerX, centerY);
-                return Boolean(hitElement && (element === hitElement || element.contains(hitElement)));
+                const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+                const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
+                return targetRectangles.some((rect) => {
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    const hitElement = document.elementFromPoint(centerX, centerY);
+                    return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
+                });
             };
             const resolveXPathElement = (xpath) => {
                 if (!xpath) {
@@ -2619,13 +2687,16 @@ def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: 
                     return null;
                 }
             };
+            const configuredAdCloseButton = resolveXPathElement(adOverlayCloseButtonXPathValue);
+            if (configuredAdCloseButton instanceof HTMLElement && isVisible(configuredAdCloseButton)) {
+                return true;
+            }
             const bodyText = document.body ? getElementText(document.body) : '';
-            const hasAdInterruptionDialog = adInterruptionPatterns.some((pattern) => pattern.test(bodyText));
+            const hasAdInterruptionDialog = adInterruptionPatterns.some((pattern) => pattern.test(`${location.href} ${bodyText}`));
             if (hasAdInterruptionDialog) {
                 const hasAdCloseAction = Array.from(document.querySelectorAll(actionableSelector))
                     .filter((element) => element instanceof HTMLElement)
                     .filter(isVisible)
-                    .filter(isPointerReceivable)
                     .some((element) => {
                         const text = getElementText(element);
                         return adCloseActionPatterns.some((pattern) => pattern.test(text))
@@ -2635,8 +2706,8 @@ def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: 
                     return true;
                 }
             }
-            const configuredButton = resolveXPathElement(adRewardConfirmButtonXPathValue);
-            if (configuredButton instanceof HTMLElement && isVisible(configuredButton) && isPointerReceivable(configuredButton)) {
+            const configuredRewardButton = resolveXPathElement(adRewardConfirmButtonXPathValue);
+            if (configuredRewardButton instanceof HTMLElement && isVisible(configuredRewardButton) && isPointerReceivable(configuredRewardButton)) {
                 return true;
             }
             return Array.from(document.querySelectorAll(actionableSelector))
@@ -2650,7 +2721,10 @@ def waitForAdRecoveryOutcomeTarget(page: Page, adRewardConfirmButtonXPathValue: 
                 });
         }
         """,
-        arg=adRewardConfirmButtonXPathValue,
+        arg={
+            "adRewardConfirmButtonXPathValue": adRewardConfirmButtonXPathValue,
+            "adOverlayCloseButtonXPathValue": adOverlayCloseButtonXPathValue,
+        },
         timeout=0,
     )
 
@@ -2661,7 +2735,7 @@ def recoverFromAdInterruptionIfPresent(
     arguments: argparse.Namespace,
     drawIndex: int,
 ) -> bool:
-    adInterruptionResolution = resolveAdInterruptionCloseSelector(page)
+    adInterruptionResolution = resolveAdInterruptionCloseSelector(page, arguments.adOverlayCloseButtonXPath)
     if not adInterruptionResolution.get("ok"):
         return False
 
@@ -2675,7 +2749,7 @@ def recoverFromAdInterruptionIfPresent(
         **clickResolvedSelectorAndWait(
             page,
             adInterruptionResolution["selector"],
-            lambda: resolveAdInterruptionCloseSelector(page),
+            lambda: resolveAdInterruptionCloseSelector(page, arguments.adOverlayCloseButtonXPath),
         ),
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_interruption_closed", adInterruptionClickPayload)
@@ -2717,7 +2791,11 @@ def recoverFromInsufficientPackIfPresent(
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_insufficient_pack_recovery_clicked", recoveryClickPayload)
 
-    waitForAdRecoveryOutcomeTarget(page, arguments.adRewardConfirmButtonXPath)
+    waitForAdRecoveryOutcomeTarget(
+        page,
+        arguments.adRewardConfirmButtonXPath,
+        arguments.adOverlayCloseButtonXPath,
+    )
 
     if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
         return True
@@ -2986,6 +3064,7 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
             "insufficientPackHeadingXPath": arguments.insufficientPackHeadingXPath,
             "recoverPackButtonXPath": arguments.recoverPackButtonXPath,
             "adRewardConfirmButtonXPath": arguments.adRewardConfirmButtonXPath,
+            "adOverlayCloseButtonXPath": arguments.adOverlayCloseButtonXPath,
             "remainingPackResolution": initialRemainingPackResolution,
         },
     )
@@ -3190,6 +3269,7 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
             "insufficientPackHeadingXPath": arguments.insufficientPackHeadingXPath,
             "recoverPackButtonXPath": arguments.recoverPackButtonXPath,
             "adRewardConfirmButtonXPath": arguments.adRewardConfirmButtonXPath,
+            "adOverlayCloseButtonXPath": arguments.adOverlayCloseButtonXPath,
             "remainingPackResolution": finalRemainingPackResolution,
         },
     )
