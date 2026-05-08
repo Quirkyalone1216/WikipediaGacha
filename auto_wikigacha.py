@@ -12,11 +12,12 @@ from playwright.sync_api import (
     BrowserContext,
     Error as PlaywrightError,
     Page,
-    TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
 
 wikiGachaUrl = "https://wikigacha.com/?lang=ZH_HANT"
+returnToPackPageButtonXPath = "/html/body/main/div/div/div[4]/div[1]/button"
+remainingPackCountXPath = "/html/body/main/div/div/div[1]/div[1]/span"
 
 
 class WikiGachaAutomationError(RuntimeError):
@@ -34,8 +35,12 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument(
         "--drawCount",
         type=int,
-        default=1,
-        help="Number of draw actions to perform. This is the only intentional run-length control.",
+        default=None,
+        help=(
+            "Optional maximum number of pack-opening lifecycles to complete. "
+            "Omit this option to keep opening packs adaptively until the page-reported remaining pack "
+            "count reaches zero; if that count is unavailable, the script falls back to pack-target presence."
+        ),
     )
     parser.add_argument(
         "--profileDir",
@@ -90,12 +95,40 @@ def parseArguments() -> argparse.Namespace:
         action="store_true",
         help="Do not tick 'do not show again' style checkboxes on entry/update notices.",
     )
+    parser.add_argument(
+        "--returnToPackPageXPath",
+        default=returnToPackPageButtonXPath,
+        help=(
+            "XPath for the button that returns from an opened pack/result view back to the pack page. "
+            "The default is the current Traditional Chinese layout path supplied for Wikipedia Gacha."
+        ),
+    )
+    parser.add_argument(
+        "--remainingPackCountXPath",
+        default=remainingPackCountXPath,
+        help=(
+            "XPath for the pack-page element that reports how many packs remain. "
+            "The default targets the current Traditional Chinese layout's 今日卡包 counter."
+        ),
+    )
     return parser.parse_args()
 
 
 def ensureArgumentsAreValid(arguments: argparse.Namespace) -> None:
-    if arguments.drawCount < 1:
+    if arguments.drawCount is not None and arguments.drawCount < 1:
         raise ValueError("--drawCount 必須大於 0。")
+
+
+def formatDrawProgress(drawIndex: int, drawCount: int | None) -> str:
+    if drawCount is None:
+        return f"{drawIndex}/auto"
+    return f"{drawIndex}/{drawCount}"
+
+
+def getDrawRunMode(arguments: argparse.Namespace) -> str:
+    if arguments.drawCount is None:
+        return "untilRemainingPackCountIsZero"
+    return "boundedDrawCountWithRemainingPackGuard"
 
 
 def createEvidenceDirectory(evidenceDir: str) -> Path:
@@ -121,12 +154,12 @@ def getPageFingerprint(page: Page) -> str:
                 href: location.href,
                 title: document.title,
                 visibleText: document.body ? document.body.innerText : "",
+                bodyMarkup: document.body ? document.body.innerHTML : "",
                 storageEntries,
             });
         }
         """
     )
-
 
 def waitForPageReady(page: Page) -> None:
     page.wait_for_load_state("domcontentloaded", timeout=0)
@@ -144,6 +177,7 @@ def waitForRenderCycle(page: Page) -> dict[str, Any]:
         r"""
         () => new Promise((resolve) => {
             let mutationCount = 0;
+            let observedFiniteAnimationCount = 0;
             const observer = new MutationObserver((mutations) => {
                 mutationCount += mutations.length;
             });
@@ -155,16 +189,49 @@ def waitForRenderCycle(page: Page) -> dict[str, Any]:
                     subtree: true,
                 });
             }
-            requestAnimationFrame(() => {
-                requestAnimationFrame(() => {
-                    observer.disconnect();
-                    resolve({ mutationCount });
+
+            const requestSettledCallback = (callback) => {
+                if (typeof window.requestIdleCallback === 'function') {
+                    window.requestIdleCallback(callback);
+                    return;
+                }
+                window.requestAnimationFrame(callback);
+            };
+
+            const getFiniteRunningAnimations = () => document
+                .getAnimations({ subtree: true })
+                .filter((animation) => {
+                    const timing = animation.effect && typeof animation.effect.getComputedTiming === 'function'
+                        ? animation.effect.getComputedTiming()
+                        : null;
+                    const hasFiniteTimeline = !timing || Number.isFinite(timing.endTime);
+                    return hasFiniteTimeline
+                        && (animation.playState === 'pending' || animation.playState === 'running');
                 });
-            });
+
+            const settle = () => {
+                const activeAnimations = getFiniteRunningAnimations();
+                if (activeAnimations.length === 0) {
+                    requestSettledCallback(() => {
+                        observer.disconnect();
+                        resolve({
+                            mutationCount,
+                            observedFiniteAnimationCount,
+                            settledBy: typeof window.requestIdleCallback === 'function'
+                                ? 'requestIdleCallback'
+                                : 'requestAnimationFrame',
+                        });
+                    });
+                    return;
+                }
+                observedFiniteAnimationCount += activeAnimations.length;
+                Promise.allSettled(activeAnimations.map((animation) => animation.finished)).then(settle);
+            };
+
+            settle();
         })
         """
     )
-
 
 def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
     return page.evaluate(
@@ -531,10 +598,10 @@ def dismissEntryGates(page: Page, evidencePath: Path, rememberDismissal: bool) -
         saveEvidence(page, evidencePath, f"entry_gate_{len(dismissedGates):03d}_dismissed", gateResolution)
 
 
-def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
+def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, Any]:
     return page.evaluate(
         r"""
-        () => {
+        (returnButtonXPath) => {
             const markerPrefix = `auto-wikigacha-target-${Date.now()}-${Math.random().toString(36).slice(2)}`;
             const candidateSelector = [
                 'button',
@@ -554,8 +621,11 @@ def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
                 /draw/iu,
                 /pull/iu,
                 /card/iu,
+                /reveal/iu,
+                /flip/iu,
                 /ガチャ/iu,
                 /パック/iu,
+                /カード/iu,
                 /開封/iu,
                 /開く/iu,
                 /引く/iu,
@@ -563,16 +633,22 @@ def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
                 /抽/iu,
                 /抽卡/iu,
                 /召喚/iu,
+                /卡/iu,
                 /卡包/iu,
                 /開包/iu,
                 /開啟/iu,
-                /點擊開啟/iu
+                /點擊/iu,
+                /點擊開啟/iu,
+                /翻/iu,
+                /揭/iu
             ];
             const highConfidencePatterns = [
                 /gacha-pack-container/iu,
                 /wiki\s*pack/iu,
                 /點擊開啟|点击开启/iu,
-                /今日卡包/iu
+                /今日卡包/iu,
+                /card[-_\s]*(back|front|container|item)|flip[-_\s]*card|reveal/iu,
+                /pack[-_\s]*(opening|result|container)/iu
             ];
             const negativePatterns = [
                 /privacy|policy|terms|contact/iu,
@@ -588,11 +664,13 @@ def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
                 /help|rule|說明|说明|遊戲說明|游戏说明/iu,
                 /share|分享/iu,
                 /ad|advertisement|廣告|广告/iu,
-                /隱私|隐私|條款|条款|聯絡|联系|お問い合わせ/iu
+                /隱私|隐私|條款|条款|聯絡|联系|お問い合わせ/iu,
+                /返回卡包頁面|返回卡包页面|回到卡包|return\s+to\s+pack|back\s+to\s+pack/iu
             ];
 
             const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
-            const getNormalizedText = (element) => [
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const getNormalizedText = (element) => normalizeWhitespace([
                 element.innerText,
                 element.textContent,
                 element.getAttribute('aria-label'),
@@ -602,7 +680,7 @@ def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
                 getClassText(element),
                 element.getAttribute('data-testid'),
                 ...Array.from(element.querySelectorAll('img[alt]')).map((image) => image.getAttribute('alt'))
-            ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+            ].filter(Boolean).join(' '));
 
             const isVisible = (element) => {
                 if (!(element instanceof HTMLElement)) {
@@ -643,13 +721,34 @@ def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
                 .map((pattern) => pattern.test(text))
                 .filter(Boolean).length;
 
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(
+                        xpath,
+                        document,
+                        null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE,
+                        null,
+                    ).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
+
+            const configuredReturnButton = resolveXPathElement(returnButtonXPath);
+            const isReturnButtonOrInside = (element) => configuredReturnButton
+                && (element === configuredReturnButton || configuredReturnButton.contains(element));
+
             const candidates = Array.from(document.querySelectorAll(candidateSelector))
                 .filter(isVisible)
                 .map((element, index) => {
-                    const actionableElement = element.closest('button, a[href], [role="button"], [onclick], [tabindex], .cursor-pointer, [id*="gacha" i], [id*="pack" i]') || element;
+                    const actionableElement = element.closest('button, a[href], [role="button"], [onclick], [tabindex], .cursor-pointer, [id*="gacha" i], [id*="pack" i], [class*="card" i]') || element;
                     const actionableText = getNormalizedText(actionableElement);
                     const elementText = getNormalizedText(element);
-                    const combinedText = `${actionableText} ${elementText}`.replace(/\s+/g, ' ').trim();
+                    const combinedText = normalizeWhitespace(`${actionableText} ${elementText}`);
                     const style = window.getComputedStyle(actionableElement);
                     const rect = actionableElement.getBoundingClientRect();
                     const positiveEvidence = getEvidenceCount(positivePatterns, combinedText);
@@ -672,12 +771,14 @@ def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
                         cursor: style.cursor,
                         area: rect.width * rect.height,
                         top: rect.top,
-                        left: rect.left
+                        left: rect.left,
+                        isConfiguredReturnButton: isReturnButtonOrInside(actionableElement),
                     };
                 })
                 .filter((candidate, index, allCandidates) => {
                     return index === allCandidates.findIndex((other) => other.element === candidate.element);
                 })
+                .filter((candidate) => !candidate.isConfiguredReturnButton)
                 .filter((candidate) => candidate.pointerReceivable)
                 .filter((candidate) => candidate.interactive)
                 .filter((candidate) => candidate.positiveEvidence > 0 || candidate.highConfidenceEvidence > 0)
@@ -708,13 +809,14 @@ def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
                 cursor: candidate.cursor,
                 area: candidate.area,
                 top: candidate.top,
-                left: candidate.left
+                left: candidate.left,
+                isConfiguredReturnButton: candidate.isConfiguredReturnButton,
             });
 
             if (candidates.length === 0) {
                 return {
                     ok: false,
-                    reason: 'No visible, pointer-receivable draw target was found.',
+                    reason: 'No visible, pointer-receivable pack/card continuation target was found.',
                     candidates: [],
                     visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
                 };
@@ -729,9 +831,9 @@ def resolveDrawTargetSelector(page: Page) -> dict[str, Any]:
                 candidates: candidates.map(summarize)
             };
         }
-        """
+        """,
+        returnButtonXPath,
     )
-
 
 def writeJson(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -781,6 +883,441 @@ def saveEvidence(page: Page, evidencePath: Path, label: str, extraPayload: dict[
     print(f"[INFO] Saved non-secret report: {reportPath}")
 
 
+
+
+def resolveRemainingPackCount(page: Page, remainingCountXPath: str) -> dict[str, Any]:
+    return page.evaluate(
+        r"""
+        (remainingCountXPath) => {
+            const markerPrefix = `auto-wikigacha-count-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const normalizeDigits = (value) => String(value || '').replace(/[０-９]/gu, (digit) => {
+                return String.fromCharCode(digit.charCodeAt(0) - 0xFF10 + 0x30);
+            });
+            const isVisible = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0;
+            };
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(
+                        xpath,
+                        document,
+                        null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE,
+                        null,
+                    ).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
+            const getElementText = (element) => normalizeWhitespace([
+                element.innerText,
+                element.textContent,
+                element.getAttribute ? element.getAttribute('aria-label') : '',
+                element.getAttribute ? element.getAttribute('title') : '',
+            ].filter(Boolean).join(' '));
+            const parseCountText = (text) => {
+                const normalizedText = normalizeDigits(text);
+                const numberMatches = Array.from(normalizedText.matchAll(/\d+/gu)).map((match) => Number.parseInt(match[0], 10));
+                const finiteNumbers = numberMatches.filter((numberValue) => Number.isFinite(numberValue));
+                if (finiteNumbers.length === 0) {
+                    return null;
+                }
+                return {
+                    remainingPackCount: finiteNumbers[0],
+                    totalPackCapacity: finiteNumbers.length > 1 ? finiteNumbers[1] : null,
+                    parsedNumbers: finiteNumbers,
+                    normalizedText,
+                };
+            };
+            const summarize = (element, source, parsedCount) => {
+                const rect = element.getBoundingClientRect();
+                return {
+                    source,
+                    text: getElementText(element).slice(0, 260),
+                    normalizedText: parsedCount.normalizedText.slice(0, 260),
+                    remainingPackCount: parsedCount.remainingPackCount,
+                    totalPackCapacity: parsedCount.totalPackCapacity,
+                    parsedNumbers: parsedCount.parsedNumbers,
+                    tagName: element.tagName.toLowerCase(),
+                    id: element.id || '',
+                    className: typeof element.className === 'string' ? element.className.slice(0, 260) : '',
+                    area: rect.width * rect.height,
+                    top: rect.top,
+                    left: rect.left,
+                };
+            };
+
+            const configuredElement = resolveXPathElement(remainingCountXPath);
+            if (configuredElement instanceof HTMLElement && isVisible(configuredElement)) {
+                const parsedCount = parseCountText(getElementText(configuredElement));
+                if (parsedCount) {
+                    const marker = `${markerPrefix}-configured-xpath`;
+                    configuredElement.setAttribute('data-auto-wikigacha-count', marker);
+                    return {
+                        ok: true,
+                        selector: `[data-auto-wikigacha-count="${marker}"]`,
+                        selected: summarize(configuredElement, 'configuredXPath', parsedCount),
+                        candidates: [summarize(configuredElement, 'configuredXPath', parsedCount)],
+                    };
+                }
+            }
+
+            const semanticCandidateSelector = ['span', 'div', 'p', '[aria-label]', '[title]'].join(',');
+            const packCounterPatterns = [
+                /今日卡包/iu,
+                /卡包/iu,
+                /pack/iu,
+                /パック/iu,
+                /\//u,
+            ];
+            const candidates = Array.from(document.querySelectorAll(semanticCandidateSelector))
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isVisible)
+                .map((element, index) => {
+                    const text = getElementText(element);
+                    const parsedCount = parseCountText(text);
+                    const evidence = packCounterPatterns
+                        .map((pattern) => pattern.test(text))
+                        .filter(Boolean)
+                        .length;
+                    const rect = element.getBoundingClientRect();
+                    return {
+                        element,
+                        marker: `${markerPrefix}-semantic-${index}`,
+                        parsedCount,
+                        evidence,
+                        area: rect.width * rect.height,
+                        top: rect.top,
+                        left: rect.left,
+                    };
+                })
+                .filter((candidate) => candidate.parsedCount && candidate.evidence > 0)
+                .sort((left, right) => {
+                    const comparisons = [
+                        right.evidence - left.evidence,
+                        left.area - right.area,
+                        left.top - right.top,
+                        left.left - right.left,
+                    ];
+                    return comparisons.find((comparison) => comparison !== 0) || 0;
+                });
+
+            if (candidates.length === 0) {
+                return {
+                    ok: false,
+                    reason: 'No visible remaining-pack counter was found or parsed.',
+                    configuredXPath: remainingCountXPath,
+                    configuredXPathVisible: configuredElement instanceof HTMLElement ? isVisible(configuredElement) : false,
+                    configuredXPathText: configuredElement instanceof HTMLElement ? getElementText(configuredElement).slice(0, 260) : '',
+                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
+                };
+            }
+
+            const selectedCandidate = candidates[0];
+            selectedCandidate.element.setAttribute('data-auto-wikigacha-count', selectedCandidate.marker);
+            return {
+                ok: true,
+                selector: `[data-auto-wikigacha-count="${selectedCandidate.marker}"]`,
+                selected: summarize(selectedCandidate.element, 'semanticFallback', selectedCandidate.parsedCount),
+                candidates: candidates.map((candidate) => summarize(candidate.element, 'semanticFallback', candidate.parsedCount)),
+            };
+        }
+        """,
+        remainingCountXPath,
+    )
+
+
+def getRemainingPackCountValue(remainingPackResolution: dict[str, Any]) -> int | None:
+    if not remainingPackResolution.get("ok"):
+        return None
+    selectedPackCount = remainingPackResolution.get("selected", {}).get("remainingPackCount")
+    return selectedPackCount if isinstance(selectedPackCount, int) else None
+
+
+def hasRemainingPacks(remainingPackResolution: dict[str, Any]) -> bool | None:
+    remainingPackCount = getRemainingPackCountValue(remainingPackResolution)
+    if remainingPackCount is None:
+        return None
+    return remainingPackCount > 0
+
+def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[str, Any]:
+    return page.evaluate(
+        r"""
+        (returnButtonXPath) => {
+            const markerPrefix = `auto-wikigacha-return-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const semanticCandidateSelector = [
+                'button',
+                'a[href]',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]'
+            ].join(',');
+            const returnPatterns = [
+                /返回卡包頁面/iu,
+                /返回卡包页面/iu,
+                /回到卡包/iu,
+                /回卡包/iu,
+                /return\s+to\s+pack/iu,
+                /back\s+to\s+pack/iu,
+                /pack\s+page/iu,
+                /パック.*戻|戻.*パック/iu
+            ];
+            const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const getNormalizedText = (element) => {
+                if (!element) {
+                    return '';
+                }
+                return normalizeWhitespace([
+                    element.innerText,
+                    element.textContent,
+                    element.getAttribute ? element.getAttribute('aria-label') : '',
+                    element.getAttribute ? element.getAttribute('title') : '',
+                    element.getAttribute ? element.getAttribute('value') : '',
+                    element.id,
+                    getClassText(element),
+                    ...Array.from(element.querySelectorAll ? element.querySelectorAll('img[alt]') : [])
+                        .map((image) => image.getAttribute('alt'))
+                ].filter(Boolean).join(' '));
+            };
+            const isVisible = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && !element.hasAttribute('disabled')
+                    && element.getAttribute('aria-disabled') !== 'true';
+            };
+            const isPointerReceivable = (element) => {
+                const rect = element.getBoundingClientRect();
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                const hitElement = document.elementFromPoint(centerX, centerY);
+                return Boolean(hitElement && (element === hitElement || element.contains(hitElement)));
+            };
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(
+                        xpath,
+                        document,
+                        null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE,
+                        null,
+                    ).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
+            const summarize = (element, source) => {
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+                return {
+                    text: getNormalizedText(element).slice(0, 260),
+                    tagName: element.tagName.toLowerCase(),
+                    role: element.getAttribute('role') || '',
+                    href: element.getAttribute('href') || '',
+                    id: element.id || '',
+                    source,
+                    pointerReceivable: isPointerReceivable(element),
+                    cursor: style.cursor,
+                    area: rect.width * rect.height,
+                    top: rect.top,
+                    left: rect.left,
+                };
+            };
+
+            const configuredElement = resolveXPathElement(returnButtonXPath);
+            if (configuredElement instanceof HTMLElement && isVisible(configuredElement) && isPointerReceivable(configuredElement)) {
+                const marker = `${markerPrefix}-configured-xpath`;
+                configuredElement.setAttribute('data-auto-wikigacha-return', marker);
+                return {
+                    ok: true,
+                    selector: `[data-auto-wikigacha-return="${marker}"]`,
+                    selected: summarize(configuredElement, 'configuredXPath'),
+                    candidates: [summarize(configuredElement, 'configuredXPath')],
+                };
+            }
+
+            const candidates = Array.from(document.querySelectorAll(semanticCandidateSelector))
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isVisible)
+                .filter(isPointerReceivable)
+                .map((element, index) => {
+                    const text = getNormalizedText(element);
+                    return {
+                        element,
+                        marker: `${markerPrefix}-semantic-${index}`,
+                        text,
+                        evidence: returnPatterns.map((pattern) => pattern.test(text)).filter(Boolean).length,
+                        summary: summarize(element, 'semanticFallback'),
+                    };
+                })
+                .filter((candidate) => candidate.evidence > 0)
+                .sort((left, right) => {
+                    const comparisons = [
+                        right.evidence - left.evidence,
+                        right.summary.area - left.summary.area,
+                        left.summary.top - right.summary.top,
+                        left.summary.left - right.summary.left,
+                    ];
+                    return comparisons.find((comparison) => comparison !== 0) || 0;
+                });
+
+            if (candidates.length === 0) {
+                return {
+                    ok: false,
+                    reason: 'No visible return-to-pack-page button was found.',
+                    configuredXPath: returnButtonXPath,
+                    configuredXPathVisible: configuredElement instanceof HTMLElement ? isVisible(configuredElement) : false,
+                    configuredXPathPointerReceivable: configuredElement instanceof HTMLElement ? isPointerReceivable(configuredElement) : false,
+                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
+                };
+            }
+
+            const selectedCandidate = candidates[0];
+            selectedCandidate.element.setAttribute('data-auto-wikigacha-return', selectedCandidate.marker);
+            return {
+                ok: true,
+                selector: `[data-auto-wikigacha-return="${selectedCandidate.marker}"]`,
+                selected: selectedCandidate.summary,
+                candidates: candidates.map((candidate) => candidate.summary),
+            };
+        }
+        """,
+        returnButtonXPath,
+    )
+
+
+def clickResolvedSelectorAndWait(page: Page, selector: str) -> dict[str, Any]:
+    previousFingerprint = getPageFingerprint(page)
+    page.locator(selector).click(timeout=0)
+    renderObservation = waitForRenderCycle(page)
+    currentFingerprint = getPageFingerprint(page)
+    return {
+        "previousFingerprintHash": buildShortHash(previousFingerprint),
+        "currentFingerprintHash": buildShortHash(currentFingerprint),
+        "fingerprintChanged": previousFingerprint != currentFingerprint,
+        "renderObservation": renderObservation,
+    }
+
+
+def completePackOpening(
+    page: Page,
+    arguments: argparse.Namespace,
+    evidencePath: Path,
+    drawIndex: int,
+    allowNoInitialTarget: bool,
+    initialRemainingPackResolution: dict[str, Any],
+) -> bool:
+    seenOpeningStateHashes: set[str] = set()
+    openingStepIndex = 0
+    hasClickedOpeningTarget = False
+
+    while True:
+        returnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
+        if returnResolution.get("ok"):
+            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_return_to_pack_target", returnResolution)
+            if arguments.dryRun:
+                print("[DRY-RUN] Return-to-pack-page target resolved; return click skipped.")
+                return True
+            returnPayload = {
+                "returnResolution": returnResolution,
+                **clickResolvedSelectorAndWait(page, returnResolution["selector"]),
+            }
+            if not returnPayload.get("fingerprintChanged"):
+                saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_return_no_change_after_click", returnPayload)
+                raise WikiGachaAutomationError(
+                    "Return-to-pack-page button was clicked, but the page fingerprint did not change. "
+                    "Inspect the return target evidence JSON/screenshot."
+                )
+            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
+            return True
+
+        openingStateHash = buildShortHash(getPageFingerprint(page))
+        if openingStateHash in seenOpeningStateHashes:
+            repeatPayload = {
+                "reason": "Opening flow reached a repeated page state before the return-to-pack-page button appeared.",
+                "openingStateHash": openingStateHash,
+                "returnResolution": returnResolution,
+            }
+            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_repeated_state", repeatPayload)
+            raise WikiGachaAutomationError(repeatPayload["reason"])
+        seenOpeningStateHashes.add(openingStateHash)
+
+        openingStepIndex += 1
+        print(
+            "[INFO] Resolving pack/card continuation target for draw "
+            f"{formatDrawProgress(drawIndex, arguments.drawCount)}, step {openingStepIndex}"
+        )
+        targetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
+        if not targetResolution.get("ok"):
+            recoveredGates = recoverFromPossibleEntryGate(
+                page,
+                evidencePath,
+                rememberDismissal=not arguments.keepEntryNotices,
+            )
+            if recoveredGates:
+                print(f"[INFO] Recovered from entry/update gate count: {len(recoveredGates)}")
+                waitForRenderCycle(page)
+                targetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
+
+        if not targetResolution.get("ok"):
+            noTargetPayload = {
+                "targetResolution": targetResolution,
+                "returnResolution": returnResolution,
+                "openingStateHash": openingStateHash,
+                "hasClickedOpeningTarget": hasClickedOpeningTarget,
+                "allowNoInitialTarget": allowNoInitialTarget,
+                "initialRemainingPackResolution": initialRemainingPackResolution,
+            }
+            if allowNoInitialTarget and not hasClickedOpeningTarget:
+                saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_no_pack_target_available", noTargetPayload)
+                print("[INFO] No further pack target was detected; adaptive run is complete.")
+                return False
+            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_no_target", noTargetPayload)
+            raise WikiGachaAutomationError(
+                targetResolution.get("reason", "No pack/card continuation target was found before the return button appeared.")
+            )
+
+        saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_target", targetResolution)
+        if arguments.dryRun:
+            print("[DRY-RUN] Pack/card continuation target resolved; click skipped.")
+            return True
+
+        progressPayload = {
+            "targetResolution": targetResolution,
+            "returnResolutionBeforeClick": returnResolution,
+            **clickResolvedSelectorAndWait(page, targetResolution["selector"]),
+        }
+        hasClickedOpeningTarget = True
+        if not progressPayload.get("fingerprintChanged"):
+            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_no_change_after_click", progressPayload)
+            raise WikiGachaAutomationError(
+                "Pack/card continuation target was clicked, but the page fingerprint did not change. "
+                "Inspect the target evidence JSON/screenshot."
+            )
+        saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_result", progressPayload)
+
 def recoverFromPossibleEntryGate(page: Page, evidencePath: Path, rememberDismissal: bool) -> list[dict[str, Any]]:
     gateResolution = resolveEntryGateActionSelector(page)
     saveEvidence(page, evidencePath, "draw_blocking_layer_diagnostics", gateResolution)
@@ -805,55 +1342,137 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
     page.goto(arguments.url, wait_until="domcontentloaded", timeout=0)
     waitForPageReady(page)
     dismissedGates = dismissEntryGates(page, evidencePath, rememberDismissal=not arguments.keepEntryNotices)
+    initialRemainingPackResolution = resolveRemainingPackCount(page, arguments.remainingPackCountXPath)
     saveEvidence(
         page,
         evidencePath,
         "before_draw",
-        {"drawCount": arguments.drawCount, "dismissedGates": dismissedGates},
+        {
+            "drawCount": arguments.drawCount,
+            "drawRunMode": getDrawRunMode(arguments),
+            "dismissedGates": dismissedGates,
+            "returnToPackPageXPath": arguments.returnToPackPageXPath,
+            "remainingPackCountXPath": arguments.remainingPackCountXPath,
+            "remainingPackResolution": initialRemainingPackResolution,
+        },
     )
 
-    for drawIndex in range(1, arguments.drawCount + 1):
-        print(f"[INFO] Resolving draw target for draw {drawIndex}/{arguments.drawCount}")
-        targetResolution = resolveDrawTargetSelector(page)
-        if not targetResolution.get("ok"):
-            recoveredGates = recoverFromPossibleEntryGate(
+    completedDrawCount = 0
+    drawIndex = 1
+    while arguments.drawCount is None or drawIndex <= arguments.drawCount:
+        remainingPackResolutionBeforeDraw = resolveRemainingPackCount(page, arguments.remainingPackCountXPath)
+        remainingPacksBeforeDraw = hasRemainingPacks(remainingPackResolutionBeforeDraw)
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_remaining_pack_count_before",
+            {
+                "completedDrawCount": completedDrawCount,
+                "drawRunMode": getDrawRunMode(arguments),
+                "remainingPackResolution": remainingPackResolutionBeforeDraw,
+            },
+        )
+
+        if remainingPacksBeforeDraw is False:
+            saveEvidence(
                 page,
                 evidencePath,
-                rememberDismissal=not arguments.keepEntryNotices,
+                "remaining_pack_count_exhausted",
+                {
+                    "completedDrawCount": completedDrawCount,
+                    "nextDrawIndex": drawIndex,
+                    "drawRunMode": getDrawRunMode(arguments),
+                    "remainingPackResolution": remainingPackResolutionBeforeDraw,
+                },
             )
-            if recoveredGates:
-                print(f"[INFO] Recovered from entry/update gate count: {len(recoveredGates)}")
-                waitForRenderCycle(page)
-                targetResolution = resolveDrawTargetSelector(page)
+            print("[INFO] Remaining pack counter reached zero; adaptive run is complete.")
+            break
 
-        if not targetResolution.get("ok"):
-            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_no_target", targetResolution)
-            raise WikiGachaAutomationError(targetResolution.get("reason", "No draw target was found."))
+        allowNoInitialTarget = arguments.drawCount is None and remainingPacksBeforeDraw is not True
+        print(
+            "[INFO] Opening pack lifecycle for draw "
+            f"{formatDrawProgress(drawIndex, arguments.drawCount)} "
+            f"with remainingPackCount={getRemainingPackCountValue(remainingPackResolutionBeforeDraw)}"
+        )
+        openedPack = completePackOpening(
+            page,
+            arguments,
+            evidencePath,
+            drawIndex,
+            allowNoInitialTarget=allowNoInitialTarget,
+            initialRemainingPackResolution=remainingPackResolutionBeforeDraw,
+        )
+        remainingPackResolutionAfterDraw = resolveRemainingPackCount(page, arguments.remainingPackCountXPath)
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_remaining_pack_count_after",
+            {
+                "completedDrawCountBeforeAccounting": completedDrawCount,
+                "openedPack": openedPack,
+                "drawRunMode": getDrawRunMode(arguments),
+                "remainingPackResolutionBeforeDraw": remainingPackResolutionBeforeDraw,
+                "remainingPackResolutionAfterDraw": remainingPackResolutionAfterDraw,
+            },
+        )
 
-        saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_target", targetResolution)
+        if not openedPack:
+            saveEvidence(
+                page,
+                evidencePath,
+                "adaptive_draws_completed",
+                {
+                    "completedDrawCount": completedDrawCount,
+                    "lastAttemptedDrawIndex": drawIndex,
+                    "drawRunMode": getDrawRunMode(arguments),
+                    "remainingPackResolution": remainingPackResolutionAfterDraw,
+                },
+            )
+            break
+
+        completedDrawCount += 1
         if arguments.dryRun:
-            print("[DRY-RUN] Target resolved; draw click skipped.")
-            continue
-
-        previousFingerprint = getPageFingerprint(page)
-        page.locator(targetResolution["selector"]).click(timeout=0)
-        renderObservation = waitForRenderCycle(page)
-        currentFingerprint = getPageFingerprint(page)
-        resultPayload = {
-            "targetResolution": targetResolution,
-            "previousFingerprintHash": buildShortHash(previousFingerprint),
-            "currentFingerprintHash": buildShortHash(currentFingerprint),
-            "fingerprintChanged": previousFingerprint != currentFingerprint,
-            "renderObservation": renderObservation,
-        }
-        if previousFingerprint == currentFingerprint:
-            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_no_change_after_click", resultPayload)
-            raise WikiGachaAutomationError(
-                "Draw target was clicked, but the page fingerprint did not change after the render cycle. "
-                "Run with --dryRun and inspect the target evidence JSON/screenshot."
+            saveEvidence(
+                page,
+                evidencePath,
+                "dry_run_completed_after_first_resolution",
+                {
+                    "completedDrawCount": completedDrawCount,
+                    "lastAttemptedDrawIndex": drawIndex,
+                    "drawRunMode": getDrawRunMode(arguments),
+                    "remainingPackResolution": remainingPackResolutionAfterDraw,
+                },
             )
-        saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_result", resultPayload)
+            break
 
+        dismissedGatesAfterReturn = dismissEntryGates(
+            page,
+            evidencePath,
+            rememberDismissal=not arguments.keepEntryNotices,
+        )
+        if dismissedGatesAfterReturn:
+            saveEvidence(
+                page,
+                evidencePath,
+                f"draw_{drawIndex:03d}_post_return_gate_dismissed",
+                {"dismissedGates": dismissedGatesAfterReturn},
+            )
+        drawIndex += 1
+
+    finalRemainingPackResolution = resolveRemainingPackCount(page, arguments.remainingPackCountXPath)
+    saveEvidence(
+        page,
+        evidencePath,
+        "after_draws",
+        {
+            "completedDrawCount": completedDrawCount,
+            "nextDrawIndex": drawIndex,
+            "drawRunMode": getDrawRunMode(arguments),
+            "drawCount": arguments.drawCount,
+            "remainingPackCountXPath": arguments.remainingPackCountXPath,
+            "remainingPackResolution": finalRemainingPackResolution,
+        },
+    )
 
 def launchPersistentContext(playwright: Any, arguments: argparse.Namespace, profilePath: Path) -> BrowserContext:
     launchOptions: dict[str, Any] = {
