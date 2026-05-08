@@ -2592,6 +2592,314 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
 
 
 
+def resolveAdCloseConfirmationTargetInFrame(frame: Any, frameIndex: int) -> dict[str, Any]:
+    try:
+        frameResolution = frame.evaluate(
+            r"""
+            ({ frameIndex, frameName, frameUrl }) => {
+                const markerPrefix = `auto-wikigacha-frame-ad-close-confirmation-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+                const dialogSelector = [
+                    '#close_confirmation_dialog',
+                    '#dialog_wrapper',
+                    '[id*="confirmation" i]',
+                    '[role="dialog"]',
+                    '[aria-modal="true"]'
+                ].join(',');
+                const actionSelector = [
+                    '#resume_video_button',
+                    '#close_video_button',
+                    '[id*="resume_video" i]',
+                    '[id*="close_video" i]',
+                    '[role="button"]',
+                    'button',
+                    '[tabindex]'
+                ].join(',');
+                const confirmationPatterns = [
+                    /要關閉影片嗎|要关闭影片吗/iu,
+                    /關閉影片嗎|关闭影片吗/iu,
+                    /close\s*(?:the\s*)?video\?/iu,
+                    /close\s*confirmation|confirmation\s*dialog/iu,
+                ];
+                const rewardLossPatterns = [
+                    /無法獲得獎勵|无法获得奖励/iu,
+                    /無法.*獎勵|无法.*奖励/iu,
+                    /失去.*獎勵|失去.*奖励/iu,
+                    /lose.*reward|without.*reward|cannot.*reward|won'?t.*reward/iu,
+                ];
+                const resumeActionPatterns = [
+                    /繼續觀看|继续观看/iu,
+                    /繼續.*看|继续.*看/iu,
+                    /resume[_\s-]*video/iu,
+                    /continue\s*(?:watching|video)/iu,
+                    /^resume_video_button$/iu,
+                ];
+                const closeActionPatterns = [
+                    /關閉影片|关闭影片/iu,
+                    /close[_\s-]*video/iu,
+                    /^close_video_button$/iu,
+                ];
+                const negativeActionPatterns = [
+                    /瞭解詳情|了解详情|learn\s*more|details/iu,
+                    /廣告|广告|ad\s*choices/iu,
+                ];
+                const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+                const getElementText = (element) => {
+                    if (!element) {
+                        return '';
+                    }
+                    return normalizeWhitespace([
+                        element.innerText,
+                        element.textContent,
+                        element.getAttribute ? element.getAttribute('aria-label') : '',
+                        element.getAttribute ? element.getAttribute('title') : '',
+                        element.getAttribute ? element.getAttribute('value') : '',
+                        element.id,
+                        getClassText(element),
+                    ].filter(Boolean).join(' '));
+                };
+                const isVisible = (element) => {
+                    if (!(element instanceof HTMLElement)) {
+                        return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.visibility !== 'hidden'
+                        && style.display !== 'none'
+                        && rect.width > 0
+                        && rect.height > 0
+                        && !element.hasAttribute('disabled')
+                        && element.getAttribute('aria-disabled') !== 'true';
+                };
+                const isPointerReceivable = (element) => {
+                    const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+                    const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
+                    return targetRectangles.some((rect) => {
+                        const centerX = rect.left + rect.width / 2;
+                        const centerY = rect.top + rect.height / 2;
+                        const hitElement = document.elementFromPoint(centerX, centerY);
+                        return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
+                    });
+                };
+                const getEvidenceCount = (patterns, text) => patterns
+                    .map((pattern) => pattern.test(text))
+                    .filter(Boolean)
+                    .length;
+                const visibleDialogs = Array.from(document.querySelectorAll(dialogSelector))
+                    .filter((element) => element instanceof HTMLElement)
+                    .filter(isVisible)
+                    .map((element) => {
+                        const text = getElementText(element);
+                        const combinedText = `${location.href} ${document.title || ''} ${text}`;
+                        const rect = element.getBoundingClientRect();
+                        return {
+                            element,
+                            text,
+                            confirmationEvidence: getEvidenceCount(confirmationPatterns, combinedText),
+                            rewardLossEvidence: getEvidenceCount(rewardLossPatterns, combinedText),
+                            area: rect.width * rect.height,
+                            top: rect.top,
+                            left: rect.left,
+                        };
+                    })
+                    .filter((dialog) => dialog.confirmationEvidence > 0 || dialog.rewardLossEvidence > 0)
+                    .sort((left, right) => {
+                        const comparisons = [
+                            right.rewardLossEvidence - left.rewardLossEvidence,
+                            right.confirmationEvidence - left.confirmationEvidence,
+                            right.area - left.area,
+                            left.top - right.top,
+                            left.left - right.left,
+                        ];
+                        return comparisons.find((comparison) => comparison !== 0) || 0;
+                    });
+                const bodyText = getElementText(document.body);
+                const bodyEvidence = {
+                    confirmationEvidence: getEvidenceCount(confirmationPatterns, `${location.href} ${document.title || ''} ${bodyText}`),
+                    rewardLossEvidence: getEvidenceCount(rewardLossPatterns, `${location.href} ${document.title || ''} ${bodyText}`),
+                };
+                const selectedDialog = visibleDialogs.length > 0
+                    ? visibleDialogs[0]
+                    : bodyEvidence.confirmationEvidence > 0 || bodyEvidence.rewardLossEvidence > 0
+                        ? {
+                            element: document.body,
+                            text: bodyText,
+                            confirmationEvidence: bodyEvidence.confirmationEvidence,
+                            rewardLossEvidence: bodyEvidence.rewardLossEvidence,
+                            area: 0,
+                            top: 0,
+                            left: 0,
+                        }
+                        : null;
+                if (!selectedDialog) {
+                    return {
+                        ok: false,
+                        reason: 'No rewarded-ad close-confirmation dialog was found in this frame.',
+                        targetScope: 'frame',
+                        frameIndex,
+                        frameName,
+                        frameUrl,
+                        visibleTextSample: bodyText.slice(0, 1000),
+                    };
+                }
+                const actionRoot = selectedDialog.element === document.body ? document : selectedDialog.element;
+                const actions = Array.from(actionRoot.querySelectorAll(actionSelector))
+                    .filter((element) => element instanceof HTMLElement)
+                    .filter(isVisible)
+                    .map((element, index) => {
+                        const text = getElementText(element);
+                        const resumeEvidence = getEvidenceCount(resumeActionPatterns, text);
+                        const closeEvidence = getEvidenceCount(closeActionPatterns, text);
+                        const negativeEvidence = getEvidenceCount(negativeActionPatterns, text);
+                        const rect = element.getBoundingClientRect();
+                        return {
+                            element,
+                            marker: `${markerPrefix}-${index}`,
+                            text,
+                            resumeEvidence,
+                            closeEvidence,
+                            negativeEvidence,
+                            pointerReceivable: isPointerReceivable(element),
+                            area: rect.width * rect.height,
+                            top: rect.top,
+                            left: rect.left,
+                        };
+                    })
+                    .filter((candidate, index, allCandidates) => index === allCandidates.findIndex((other) => other.element === candidate.element))
+                    .filter((candidate) => candidate.negativeEvidence === 0)
+                    .filter((candidate) => {
+                        if (selectedDialog.rewardLossEvidence > 0) {
+                            return candidate.resumeEvidence > 0;
+                        }
+                        return candidate.resumeEvidence > 0 || candidate.closeEvidence > 0;
+                    })
+                    .sort((left, right) => {
+                        const comparisons = selectedDialog.rewardLossEvidence > 0
+                            ? [
+                                right.resumeEvidence - left.resumeEvidence,
+                                Number(right.pointerReceivable) - Number(left.pointerReceivable),
+                                right.area - left.area,
+                                right.left - left.left,
+                            ]
+                            : [
+                                right.closeEvidence - left.closeEvidence,
+                                right.resumeEvidence - left.resumeEvidence,
+                                Number(right.pointerReceivable) - Number(left.pointerReceivable),
+                                right.area - left.area,
+                                left.left - right.left,
+                            ];
+                        return comparisons.find((comparison) => comparison !== 0) || 0;
+                    });
+                const summarizeAction = (candidate) => {
+                    const rect = candidate.element.getBoundingClientRect();
+                    const style = window.getComputedStyle(candidate.element);
+                    return {
+                        targetScope: 'frame',
+                        frameIndex,
+                        frameName,
+                        frameUrl,
+                        source: selectedDialog.rewardLossEvidence > 0
+                            ? 'rewardedAdCloseConfirmationResumeButton'
+                            : candidate.closeEvidence > 0
+                                ? 'rewardedAdCloseConfirmationCloseButton'
+                                : 'rewardedAdCloseConfirmationResumeButton',
+                        selector: candidate.selector,
+                        actionIntent: selectedDialog.rewardLossEvidence > 0
+                            ? 'resumeVideoToPreserveReward'
+                            : candidate.closeEvidence > 0
+                                ? 'closeVideoAfterConfirmation'
+                                : 'resumeVideo',
+                        text: candidate.text.slice(0, 260),
+                        dialogText: selectedDialog.text.slice(0, 520),
+                        tagName: candidate.element.tagName.toLowerCase(),
+                        role: candidate.element.getAttribute('role') || '',
+                        id: candidate.element.id || '',
+                        className: getClassText(candidate.element).slice(0, 260),
+                        confirmationEvidence: selectedDialog.confirmationEvidence,
+                        rewardLossEvidence: selectedDialog.rewardLossEvidence,
+                        resumeEvidence: candidate.resumeEvidence,
+                        closeEvidence: candidate.closeEvidence,
+                        negativeEvidence: candidate.negativeEvidence,
+                        pointerReceivable: candidate.pointerReceivable,
+                        cursor: style.cursor,
+                        area: rect.width * rect.height,
+                        top: rect.top,
+                        left: rect.left,
+                    };
+                };
+                if (actions.length === 0) {
+                    return {
+                        ok: false,
+                        reason: selectedDialog.rewardLossEvidence > 0
+                            ? 'Reward-loss close-confirmation dialog was found, but no safe resume-video action was resolved.'
+                            : 'Close-confirmation dialog was found, but no semantic confirmation action was resolved.',
+                        targetScope: 'frame',
+                        frameIndex,
+                        frameName,
+                        frameUrl,
+                        dialog: {
+                            text: selectedDialog.text.slice(0, 520),
+                            confirmationEvidence: selectedDialog.confirmationEvidence,
+                            rewardLossEvidence: selectedDialog.rewardLossEvidence,
+                        },
+                        visibleTextSample: bodyText.slice(0, 1000),
+                    };
+                }
+                const selectedAction = actions[0];
+                selectedAction.element.setAttribute('data-auto-wikigacha-frame-close-confirmation', selectedAction.marker);
+                selectedAction.selector = `[data-auto-wikigacha-frame-close-confirmation="${selectedAction.marker}"]`;
+                return {
+                    ok: true,
+                    targetScope: 'frame',
+                    frameIndex,
+                    frameName,
+                    frameUrl,
+                    selector: selectedAction.selector,
+                    selected: summarizeAction(selectedAction),
+                    candidates: actions.map((candidate) => {
+                        candidate.selector = candidate.selector || '';
+                        return summarizeAction(candidate);
+                    }),
+                };
+            }
+            """,
+            {
+                "frameIndex": frameIndex,
+                "frameName": frame.name,
+                "frameUrl": frame.url,
+            },
+        )
+        return frameResolution
+    except PlaywrightError as error:
+        return {
+            "ok": False,
+            "targetScope": "frame",
+            "frameIndex": frameIndex,
+            "frameName": getattr(frame, "name", ""),
+            "frameUrl": getattr(frame, "url", ""),
+            "reason": "Frame close-confirmation inspection failed.",
+            "errorType": type(error).__name__,
+            "errorMessage": str(error),
+        }
+
+
+def resolveAdCloseConfirmationTarget(page: Page) -> dict[str, Any]:
+    frameDiagnostics: list[dict[str, Any]] = []
+    for frameIndex, frame in enumerate(page.frames):
+        if frame == page.main_frame:
+            continue
+        frameResolution = resolveAdCloseConfirmationTargetInFrame(frame, frameIndex)
+        if frameResolution.get("ok"):
+            return frameResolution
+        frameDiagnostics.append(frameResolution)
+    return {
+        "ok": False,
+        "reason": "No rewarded-ad close-confirmation target was found in any child frame.",
+        "targetScope": "frame",
+        "frameDiagnostics": frameDiagnostics,
+    }
+
+
 def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]:
     try:
         frameResolution = frame.evaluate(
@@ -2632,6 +2940,12 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                 const negativePatterns = [
                     /瞭解詳情|了解详情|learn\s*more|details/iu,
                     /YAMAHA|JOG|葉黃素|新聞|news/iu,
+                ];
+                const rewardPendingPatterns = [
+                    /(?:\d+|[０-９]+)\s*秒(?:後|后).*?(?:獎勵|奖励)/iu,
+                    /秒(?:後|后)可(?:獲|获)(?:得)?(?:獎勵|奖励)/iu,
+                    /reward.*(?:in|after)\s*(?:\d+|[０-９]+)\s*(?:s|sec|second)/iu,
+                    /(?:wait|available).*?(?:\d+|[０-９]+).*?(?:reward|second|sec)/iu,
                 ];
                 const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
                 const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
@@ -2693,6 +3007,8 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                         className: getClassText(candidate.element).slice(0, 260),
                         closeEvidence: candidate.closeEvidence,
                         frameEvidence: candidate.frameEvidence,
+                        rewardPendingEvidence: candidate.rewardPendingEvidence,
+                        isPrimaryRewardedCloseButton: candidate.isPrimaryRewardedCloseButton,
                         negativeEvidence: candidate.negativeEvidence,
                         pointerReceivable: isPointerReceivable(candidate.element),
                         cursor: style.cursor,
@@ -2701,6 +3017,11 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                         left: rect.left,
                     };
                 };
+                const frameBodyText = getElementText(document.body);
+                const rewardPendingEvidence = getEvidenceCount(
+                    rewardPendingPatterns,
+                    `${location.href} ${document.title || ''} ${frameBodyText}`,
+                );
                 const candidates = Array.from(document.querySelectorAll(closeCandidateSelector))
                     .filter((element) => element instanceof HTMLElement)
                     .filter(isVisible)
@@ -2712,6 +3033,7 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                         const closeEvidence = idEvidence + ariaEvidence + getEvidenceCount(closeEvidencePatterns, text);
                         const frameEvidence = getEvidenceCount(frameEvidencePatterns, frameContextText);
                         const negativeEvidence = getEvidenceCount(negativePatterns, text);
+                        const isPrimaryRewardedCloseButton = idEvidence > 0 || ariaEvidence > 0;
                         return {
                             element,
                             marker: `${markerPrefix}-${index}`,
@@ -2719,14 +3041,17 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                             selector: '',
                             closeEvidence,
                             frameEvidence,
+                            rewardPendingEvidence,
+                            isPrimaryRewardedCloseButton,
                             negativeEvidence,
-                            source: idEvidence > 0 || ariaEvidence > 0
+                            source: isPrimaryRewardedCloseButton
                                 ? 'googleRewardedFrameCloseButton'
                                 : 'semanticFrameCloseButton',
                         };
                     })
                     .filter((candidate, index, allCandidates) => index === allCandidates.findIndex((other) => other.element === candidate.element))
                     .filter((candidate) => candidate.negativeEvidence === 0)
+                    .filter((candidate) => !(candidate.rewardPendingEvidence > 0 && candidate.isPrimaryRewardedCloseButton))
                     .filter((candidate) => candidate.closeEvidence > 0 || candidate.frameEvidence > 0)
                     .sort((left, right) => {
                         const comparisons = [
@@ -2741,11 +3066,14 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
                 if (candidates.length === 0) {
                     return {
                         ok: false,
-                        reason: 'No visible frame-level rewarded-ad close button was found.',
+                        reason: rewardPendingEvidence > 0
+                            ? 'Rewarded-ad close button is visible but reward eligibility is still pending; waiting instead of triggering the reward-loss confirmation dialog.'
+                            : 'No visible frame-level rewarded-ad close button was found.',
                         targetScope: 'frame',
                         frameIndex,
                         frameName,
                         frameUrl,
+                        rewardPendingEvidence,
                         visibleTextSample: document.body ? document.body.innerText.slice(0, 1000) : '',
                     };
                 }
@@ -2788,9 +3116,19 @@ def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]
 
 
 def resolveAdInterruptionCloseTarget(page: Page, adOverlayCloseButtonXPathValue: str) -> dict[str, Any]:
+    closeConfirmationDiagnostics: list[dict[str, Any]] = []
+    for frameIndex, frame in enumerate(page.frames):
+        if frame == page.main_frame:
+            continue
+        closeConfirmationResolution = resolveAdCloseConfirmationTargetInFrame(frame, frameIndex)
+        if closeConfirmationResolution.get("ok"):
+            return closeConfirmationResolution
+        closeConfirmationDiagnostics.append(closeConfirmationResolution)
+
     pageResolution = resolveAdInterruptionCloseSelector(page, adOverlayCloseButtonXPathValue)
     if pageResolution.get("ok"):
         pageResolution["targetScope"] = "page"
+        pageResolution["frameCloseConfirmationDiagnostics"] = closeConfirmationDiagnostics
         return pageResolution
 
     frameDiagnostics: list[dict[str, Any]] = []
@@ -2799,10 +3137,12 @@ def resolveAdInterruptionCloseTarget(page: Page, adOverlayCloseButtonXPathValue:
             continue
         frameResolution = resolveAdCloseSelectorInFrame(frame, frameIndex)
         if frameResolution.get("ok"):
+            frameResolution["frameCloseConfirmationDiagnostics"] = closeConfirmationDiagnostics
             return frameResolution
         frameDiagnostics.append(frameResolution)
 
     pageResolution["targetScope"] = "page"
+    pageResolution["frameCloseConfirmationDiagnostics"] = closeConfirmationDiagnostics
     pageResolution["frameDiagnostics"] = frameDiagnostics
     return pageResolution
 
