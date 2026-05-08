@@ -2591,142 +2591,582 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
     )
 
 
+
+def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]:
+    try:
+        frameResolution = frame.evaluate(
+            r"""
+            ({ frameIndex, frameName, frameUrl }) => {
+                const markerPrefix = `auto-wikigacha-frame-ad-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+                const closeCandidateSelector = [
+                    '#close_button[role="button"]',
+                    '#close_button[tabindex]',
+                    '#close_button',
+                    '[aria-label="關閉影片"]',
+                    '[aria-label="关闭影片"]',
+                    '[aria-label*="關閉影片"]',
+                    '[aria-label*="关闭影片"]',
+                    '[aria-label*="close video" i]',
+                    '[aria-label*="close ad" i]',
+                    '[aria-label*="close" i]',
+                    '[id*="close" i][role="button"]',
+                    '[id*="close" i][tabindex]',
+                    '[class*="close" i][role="button"]',
+                    '[class*="close" i][tabindex]',
+                    '[role="button"]',
+                    '[tabindex]'
+                ].join(',');
+                const closeEvidencePatterns = [
+                    /關閉影片|关闭影片/iu,
+                    /close\s*video/iu,
+                    /關閉廣告|关闭广告/iu,
+                    /close\s*(?:ad|advertisement)/iu,
+                    /^close_button$/iu,
+                    /rewarded[_-]?ad[_-]?close/iu,
+                    /^\s*[×✕✖x]\s*$/iu,
+                ];
+                const frameEvidencePatterns = [
+                    /googlesyndication|safeframe|goog_rewarded|rewarded|google/iu,
+                    /ad|ads|advertisement/iu,
+                ];
+                const negativePatterns = [
+                    /瞭解詳情|了解详情|learn\s*more|details/iu,
+                    /YAMAHA|JOG|葉黃素|新聞|news/iu,
+                ];
+                const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+                const getElementText = (element) => {
+                    if (!element) {
+                        return '';
+                    }
+                    return normalizeWhitespace([
+                        element.innerText,
+                        element.textContent,
+                        element.getAttribute ? element.getAttribute('aria-label') : '',
+                        element.getAttribute ? element.getAttribute('title') : '',
+                        element.getAttribute ? element.getAttribute('value') : '',
+                        element.id,
+                        getClassText(element),
+                    ].filter(Boolean).join(' '));
+                };
+                const isVisible = (element) => {
+                    if (!(element instanceof HTMLElement)) {
+                        return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.visibility !== 'hidden'
+                        && style.display !== 'none'
+                        && rect.width > 0
+                        && rect.height > 0
+                        && !element.hasAttribute('disabled')
+                        && element.getAttribute('aria-disabled') !== 'true';
+                };
+                const isPointerReceivable = (element) => {
+                    const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+                    const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
+                    return targetRectangles.some((rect) => {
+                        const centerX = rect.left + rect.width / 2;
+                        const centerY = rect.top + rect.height / 2;
+                        const hitElement = document.elementFromPoint(centerX, centerY);
+                        return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
+                    });
+                };
+                const getEvidenceCount = (patterns, text) => patterns
+                    .map((pattern) => pattern.test(text))
+                    .filter(Boolean)
+                    .length;
+                const summarizeCandidate = (candidate) => {
+                    const rect = candidate.element.getBoundingClientRect();
+                    const style = window.getComputedStyle(candidate.element);
+                    return {
+                        targetScope: 'frame',
+                        frameIndex,
+                        frameName,
+                        frameUrl,
+                        source: candidate.source,
+                        selector: candidate.selector,
+                        text: candidate.text.slice(0, 260),
+                        tagName: candidate.element.tagName.toLowerCase(),
+                        role: candidate.element.getAttribute('role') || '',
+                        id: candidate.element.id || '',
+                        className: getClassText(candidate.element).slice(0, 260),
+                        closeEvidence: candidate.closeEvidence,
+                        frameEvidence: candidate.frameEvidence,
+                        negativeEvidence: candidate.negativeEvidence,
+                        pointerReceivable: isPointerReceivable(candidate.element),
+                        cursor: style.cursor,
+                        area: rect.width * rect.height,
+                        top: rect.top,
+                        left: rect.left,
+                    };
+                };
+                const candidates = Array.from(document.querySelectorAll(closeCandidateSelector))
+                    .filter((element) => element instanceof HTMLElement)
+                    .filter(isVisible)
+                    .map((element, index) => {
+                        const text = getElementText(element);
+                        const frameContextText = `${location.href} ${document.title || ''} ${text}`;
+                        const idEvidence = element.id === 'close_button' ? 2 : 0;
+                        const ariaEvidence = /關閉影片|关闭影片|close\s*video/iu.test(element.getAttribute('aria-label') || '') ? 3 : 0;
+                        const closeEvidence = idEvidence + ariaEvidence + getEvidenceCount(closeEvidencePatterns, text);
+                        const frameEvidence = getEvidenceCount(frameEvidencePatterns, frameContextText);
+                        const negativeEvidence = getEvidenceCount(negativePatterns, text);
+                        return {
+                            element,
+                            marker: `${markerPrefix}-${index}`,
+                            text,
+                            selector: '',
+                            closeEvidence,
+                            frameEvidence,
+                            negativeEvidence,
+                            source: idEvidence > 0 || ariaEvidence > 0
+                                ? 'googleRewardedFrameCloseButton'
+                                : 'semanticFrameCloseButton',
+                        };
+                    })
+                    .filter((candidate, index, allCandidates) => index === allCandidates.findIndex((other) => other.element === candidate.element))
+                    .filter((candidate) => candidate.negativeEvidence === 0)
+                    .filter((candidate) => candidate.closeEvidence > 0 || candidate.frameEvidence > 0)
+                    .sort((left, right) => {
+                        const comparisons = [
+                            right.closeEvidence - left.closeEvidence,
+                            right.frameEvidence - left.frameEvidence,
+                            Number(isPointerReceivable(right.element)) - Number(isPointerReceivable(left.element)),
+                            right.element.getBoundingClientRect().top - left.element.getBoundingClientRect().top,
+                            right.element.getBoundingClientRect().left - left.element.getBoundingClientRect().left,
+                        ];
+                        return comparisons.find((comparison) => comparison !== 0) || 0;
+                    });
+                if (candidates.length === 0) {
+                    return {
+                        ok: false,
+                        reason: 'No visible frame-level rewarded-ad close button was found.',
+                        targetScope: 'frame',
+                        frameIndex,
+                        frameName,
+                        frameUrl,
+                        visibleTextSample: document.body ? document.body.innerText.slice(0, 1000) : '',
+                    };
+                }
+                const selectedCandidate = candidates[0];
+                selectedCandidate.element.setAttribute('data-auto-wikigacha-frame-ad-close', selectedCandidate.marker);
+                selectedCandidate.selector = `[data-auto-wikigacha-frame-ad-close="${selectedCandidate.marker}"]`;
+                return {
+                    ok: true,
+                    targetScope: 'frame',
+                    frameIndex,
+                    frameName,
+                    frameUrl,
+                    selector: selectedCandidate.selector,
+                    selected: summarizeCandidate(selectedCandidate),
+                    candidates: candidates.map((candidate) => {
+                        candidate.selector = candidate.selector || '';
+                        return summarizeCandidate(candidate);
+                    }),
+                };
+            }
+            """,
+            {
+                "frameIndex": frameIndex,
+                "frameName": frame.name,
+                "frameUrl": frame.url,
+            },
+        )
+        return frameResolution
+    except PlaywrightError as error:
+        return {
+            "ok": False,
+            "targetScope": "frame",
+            "frameIndex": frameIndex,
+            "frameName": getattr(frame, "name", ""),
+            "frameUrl": getattr(frame, "url", ""),
+            "reason": "Frame close-button inspection failed.",
+            "errorType": type(error).__name__,
+            "errorMessage": str(error),
+        }
+
+
+def resolveAdInterruptionCloseTarget(page: Page, adOverlayCloseButtonXPathValue: str) -> dict[str, Any]:
+    pageResolution = resolveAdInterruptionCloseSelector(page, adOverlayCloseButtonXPathValue)
+    if pageResolution.get("ok"):
+        pageResolution["targetScope"] = "page"
+        return pageResolution
+
+    frameDiagnostics: list[dict[str, Any]] = []
+    for frameIndex, frame in enumerate(page.frames):
+        if frame == page.main_frame:
+            continue
+        frameResolution = resolveAdCloseSelectorInFrame(frame, frameIndex)
+        if frameResolution.get("ok"):
+            return frameResolution
+        frameDiagnostics.append(frameResolution)
+
+    pageResolution["targetScope"] = "page"
+    pageResolution["frameDiagnostics"] = frameDiagnostics
+    return pageResolution
+
+
+def resolveFrameForResolution(page: Page, resolution: dict[str, Any]) -> Any | None:
+    frameIndex = resolution.get("frameIndex")
+    frameUrl = resolution.get("frameUrl")
+    frameName = resolution.get("frameName")
+    frames = page.frames
+    if isinstance(frameIndex, int) and 0 <= frameIndex < len(frames):
+        indexedFrame = frames[frameIndex]
+        if (not frameUrl or indexedFrame.url == frameUrl) and (frameName is None or indexedFrame.name == frameName):
+            return indexedFrame
+    for frame in frames:
+        if frameUrl and frame.url == frameUrl and (frameName is None or frame.name == frameName):
+            return frame
+    for frame in frames:
+        if frameUrl and frameUrl in frame.url:
+            return frame
+    return None
+
+
+def clickSelectorUsingFreshFrameElement(page: Page, resolution: dict[str, Any]) -> dict[str, Any]:
+    frame = resolveFrameForResolution(page, resolution)
+    selector = str(resolution.get("selector") or "")
+    if frame is None:
+        return {
+            "ok": False,
+            "reason": "frameCouldNotBeResolvedForAdCloseTarget",
+            "selectorRefreshRecommended": True,
+            "targetScope": "frame",
+            "frameIndex": resolution.get("frameIndex"),
+            "frameName": resolution.get("frameName"),
+            "frameUrl": resolution.get("frameUrl"),
+            "selector": selector,
+        }
+    try:
+        return frame.evaluate(
+            r"""
+            (selector) => new Promise((resolve) => {
+                const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                const summarizeElement = (element) => {
+                    if (!(element instanceof HTMLElement)) {
+                        return null;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    const style = window.getComputedStyle(element);
+                    return {
+                        tagName: element.tagName.toLowerCase(),
+                        id: element.id || '',
+                        className: typeof element.className === 'string' ? element.className.slice(0, 260) : '',
+                        role: element.getAttribute('role') || '',
+                        ariaLabel: element.getAttribute('aria-label') || '',
+                        text: normalizeWhitespace([
+                            element.innerText,
+                            element.textContent,
+                            element.getAttribute('aria-label'),
+                            element.getAttribute('title'),
+                            element.getAttribute('value'),
+                        ].filter(Boolean).join(' ')).slice(0, 260),
+                        connected: element.isConnected,
+                        rect: {
+                            left: rect.left,
+                            top: rect.top,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                            width: rect.width,
+                            height: rect.height,
+                        },
+                        display: style.display,
+                        visibility: style.visibility,
+                        opacity: style.opacity,
+                        pointerEvents: style.pointerEvents,
+                    };
+                };
+                const isUsableElement = (element) => {
+                    if (!(element instanceof HTMLElement)) {
+                        return { ok: false, reason: 'selectorDidNotResolveToHTMLElement' };
+                    }
+                    if (!element.isConnected || !document.documentElement.contains(element)) {
+                        return { ok: false, reason: 'elementIsDetachedFromDom' };
+                    }
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    if (style.visibility === 'hidden' || style.display === 'none' || rect.width <= 0 || rect.height <= 0) {
+                        return { ok: false, reason: 'elementIsNotRendered' };
+                    }
+                    if (element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true') {
+                        return { ok: false, reason: 'elementIsDisabled' };
+                    }
+                    return { ok: true, reason: 'elementIsFreshAndUsable' };
+                };
+                const getPointerReceivable = (element) => {
+                    const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+                    const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
+                    return targetRectangles.some((rect) => {
+                        const centerX = rect.left + rect.width / 2;
+                        const centerY = rect.top + rect.height / 2;
+                        const hitElement = document.elementFromPoint(centerX, centerY);
+                        return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
+                    });
+                };
+                const resolveCurrentElement = () => document.querySelector(selector);
+                const initialElement = resolveCurrentElement();
+                const initialValidation = isUsableElement(initialElement);
+                if (!initialValidation.ok) {
+                    resolve({
+                        ok: false,
+                        reason: initialValidation.reason,
+                        selector,
+                        targetScope: 'frame',
+                        selectorRefreshRecommended: true,
+                        elementSummary: summarizeElement(initialElement),
+                    });
+                    return;
+                }
+                window.requestAnimationFrame(() => {
+                    const freshElement = resolveCurrentElement();
+                    const freshValidation = isUsableElement(freshElement);
+                    if (!freshValidation.ok) {
+                        resolve({
+                            ok: false,
+                            reason: freshValidation.reason,
+                            selector,
+                            targetScope: 'frame',
+                            selectorRefreshRecommended: true,
+                            elementSummary: summarizeElement(freshElement),
+                        });
+                        return;
+                    }
+                    const pointerReceivable = getPointerReceivable(freshElement);
+                    try {
+                        freshElement.click();
+                        resolve({
+                            ok: true,
+                            reason: 'clickedFreshFrameDomElement',
+                            selector,
+                            targetScope: 'frame',
+                            clickMethod: 'HTMLElement.click',
+                            pointerReceivable,
+                            elementSummary: summarizeElement(freshElement),
+                        });
+                    } catch (error) {
+                        resolve({
+                            ok: false,
+                            reason: 'frameDomClickRaisedException',
+                            selector,
+                            targetScope: 'frame',
+                            selectorRefreshRecommended: true,
+                            errorName: error && error.name ? error.name : '',
+                            errorMessage: error && error.message ? error.message : String(error),
+                            pointerReceivable,
+                            elementSummary: summarizeElement(freshElement),
+                        });
+                    }
+                });
+            })
+            """,
+            selector,
+        )
+    except PlaywrightError as error:
+        return {
+            "ok": False,
+            "reason": "frameDomClickEvaluationFailed",
+            "selectorRefreshRecommended": True,
+            "targetScope": "frame",
+            "selector": selector,
+            "frameIndex": resolution.get("frameIndex"),
+            "frameName": resolution.get("frameName"),
+            "frameUrl": resolution.get("frameUrl"),
+            "errorType": type(error).__name__,
+            "errorMessage": str(error),
+        }
+
+
+def clickResolvedAdCloseTargetAndWait(
+    page: Page,
+    resolution: dict[str, Any],
+    refreshResolution: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    previousFingerprint = getPageFingerprint(page)
+    previousRenderedStateFingerprint = getRenderedStateFingerprint(page)
+    currentResolution = resolution
+    clickAttempts: list[dict[str, Any]] = []
+    refreshedResolutions: list[dict[str, Any]] = []
+    seenRefreshedResolutionFingerprints: set[str] = set()
+
+    while True:
+        if currentResolution.get("targetScope") == "frame":
+            clickAttempt = clickSelectorUsingFreshFrameElement(page, currentResolution)
+        else:
+            clickAttempt = clickSelectorUsingFreshDomElement(page, currentResolution["selector"])
+        clickAttempts.append(clickAttempt)
+        if clickAttempt.get("ok"):
+            break
+        if not clickAttempt.get("selectorRefreshRecommended"):
+            raise WikiGachaAutomationError(
+                "Resolved ad-close selector could not be clicked and did not expose a refresh path."
+            )
+        refreshedResolution = refreshResolution()
+        refreshedResolutions.append(refreshedResolution)
+        if not refreshedResolution.get("ok"):
+            raise WikiGachaAutomationError(
+                refreshedResolution.get(
+                    "reason",
+                    "Resolved ad-close selector became stale and no fresh replacement target could be resolved.",
+                )
+            )
+        refreshedResolutionFingerprint = buildResolutionFingerprint(refreshedResolution)
+        if refreshedResolutionFingerprint in seenRefreshedResolutionFingerprints:
+            raise WikiGachaAutomationError(
+                "Resolved ad-close selector repeatedly became stale after semantic refresh."
+            )
+        seenRefreshedResolutionFingerprints.add(refreshedResolutionFingerprint)
+        currentResolution = refreshedResolution
+
+    renderObservation = waitForRenderCycle(page)
+    currentFingerprint = getPageFingerprint(page)
+    currentRenderedStateFingerprint = getRenderedStateFingerprint(page)
+    pageFingerprintChanged = previousFingerprint != currentFingerprint
+    renderedStateChanged = previousRenderedStateFingerprint != currentRenderedStateFingerprint
+    stateChanged = pageFingerprintChanged or renderedStateChanged
+    return {
+        "previousFingerprintHash": buildShortHash(previousFingerprint),
+        "currentFingerprintHash": buildShortHash(currentFingerprint),
+        "previousRenderedStateFingerprintHash": buildShortHash(previousRenderedStateFingerprint),
+        "currentRenderedStateFingerprintHash": buildShortHash(currentRenderedStateFingerprint),
+        "pageFingerprintChanged": pageFingerprintChanged,
+        "renderedStateChanged": renderedStateChanged,
+        "stateChanged": stateChanged,
+        "fingerprintChanged": stateChanged,
+        "clickCompleted": True,
+        "clickAborted": False,
+        "initialResolution": resolution,
+        "finalResolution": currentResolution,
+        "clickAttempts": clickAttempts,
+        "refreshedResolutions": refreshedResolutions,
+        "renderObservation": renderObservation,
+    }
+
+
+def waitForAdOutcomeMutationOrPaint(page: Page) -> None:
+    page.evaluate(
+        r"""
+        () => new Promise((resolve) => {
+            let resolved = false;
+            const finish = () => {
+                if (resolved) {
+                    return;
+                }
+                resolved = true;
+                if (observer) {
+                    observer.disconnect();
+                }
+                requestAnimationFrame(() => requestAnimationFrame(resolve));
+            };
+            const observer = document.documentElement
+                ? new MutationObserver(finish)
+                : null;
+            if (observer && document.documentElement) {
+                observer.observe(document.documentElement, {
+                    attributes: true,
+                    childList: true,
+                    characterData: true,
+                    subtree: true,
+                });
+            }
+            requestAnimationFrame(finish);
+        })
+        """
+    )
+
+
+
+def resolvePackReadyAfterAdRecoveryOutcome(
+    page: Page,
+    remainingCountXPath: str,
+    insufficientPackHeadingXPathValue: str,
+    recoverPackButtonXPathValue: str,
+    returnButtonXPath: str,
+) -> dict[str, Any]:
+    remainingPackResolution = resolveRemainingPackCount(
+        page,
+        remainingCountXPath,
+        insufficientPackHeadingXPathValue,
+    )
+    remainingPackCount = getRemainingPackCountValue(remainingPackResolution)
+    if isinstance(remainingPackCount, int) and remainingPackCount > 0:
+        return {
+            "ok": True,
+            "outcomeType": "remainingPackCountBecamePositive",
+            "remainingPackResolution": remainingPackResolution,
+        }
+
+    drawTargetResolution = resolveDrawTargetSelector(page, returnButtonXPath)
+    if drawTargetResolution.get("ok"):
+        return {
+            "ok": True,
+            "outcomeType": "packTargetBecameAvailable",
+            "remainingPackResolution": remainingPackResolution,
+            "drawTargetResolution": drawTargetResolution,
+        }
+
+    insufficientPackRecoveryResolution = resolveInsufficientPackRecoverySelector(
+        page,
+        insufficientPackHeadingXPathValue,
+        recoverPackButtonXPathValue,
+    )
+    if insufficientPackRecoveryResolution.get("ok"):
+        return {
+            "ok": True,
+            "outcomeType": "insufficientPackRecoveryStillAvailable",
+            "remainingPackResolution": remainingPackResolution,
+            "drawTargetResolution": drawTargetResolution,
+            "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+        }
+
+    return {
+        "ok": False,
+        "reason": "No post-ad pack-ready state was resolved yet.",
+        "remainingPackResolution": remainingPackResolution,
+        "drawTargetResolution": drawTargetResolution,
+        "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+    }
+
+
 def waitForAdRecoveryOutcomeTarget(
     page: Page,
     adRewardConfirmButtonXPathValue: str,
     adOverlayCloseButtonXPathValue: str,
-) -> None:
-    page.wait_for_function(
-        r"""
-        ({ adRewardConfirmButtonXPathValue, adOverlayCloseButtonXPathValue }) => {
-            const actionableSelector = [
-                'button',
-                'a[href]',
-                '[role="button"]',
-                '[onclick]',
-                '[tabindex]'
-            ].join(',');
-            const rewardConfirmationPatterns = [
-                /^(?:確定|確認|關閉|關掉|領取|獲得|取得|完成|繼續|開始|好|OK)$/iu,
-                /^(?:确定|确认|关闭|领取|获得|取得|完成|继续|开始|好|OK)$/iu,
-                /(?:claim|collect|get|receive|close|continue|done|confirm|ok|reward)/iu,
-                /^(?:閉じる|確認|受け取る|獲得|取得|完了|続ける|OK)$/iu,
-            ];
-            const adInterruptionPatterns = [
-                /贊助鏈接|赞助链接|sponsored\s*link/iu,
-                /Monetag/iu,
-                /廣告已暫時停用|广告已暂时停用/iu,
-                /廣告.*暫時.*停用|广告.*暂时.*停用/iu,
-                /ad(?:vertisement)?\s*(?:temporarily\s*)?(?:disabled|unavailable|paused|suspended)/iu,
-                /請稍候|请稍候|please\s*wait/iu,
-                /#goog_rewarded|goog_rewarded|rewarded\s*ad|google\s*rewarded/iu,
-            ];
-            const adCloseActionPatterns = [
-                /^(?:關閉廣告|关闭广告|關閉|关闭|關掉|關閉視窗|关闭窗口)$/iu,
-                /^(?:close\s*(?:ad|advertisement)?|dismiss)$/iu,
-                /^(?:広告を閉じる|閉じる)$/iu,
-                /(?:關閉|关闭|close|dismiss).*(?:廣告|广告|ad|advertisement)/iu,
-                /(?:廣告|广告|ad|advertisement).*(?:關閉|关闭|close|dismiss)/iu,
-                /^\s*[×✕✖x]\s*$/iu,
-            ];
-            const negativePatterns = [
-                /圖鑑|图鉴|図鑑/iu,
-                /對戰|对战|battle|バトル/iu,
-                /獎盃|奖杯|trophy/iu,
-                /遊戲說明|游戏说明|help|rule/iu,
-                /privacy|policy|terms|contact/iu,
-                /隱私|隐私|條款|条款|聯絡|联系/iu,
-                /瞭解詳情|了解详情|learn\s*more|details/iu,
-            ];
-            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-            const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
-            const getElementText = (element) => {
-                if (!element) {
-                    return '';
-                }
-                return normalizeWhitespace([
-                    element.innerText,
-                    element.textContent,
-                    element.getAttribute ? element.getAttribute('aria-label') : '',
-                    element.getAttribute ? element.getAttribute('title') : '',
-                    element.getAttribute ? element.getAttribute('value') : '',
-                    element.id,
-                    getClassText(element),
-                ].filter(Boolean).join(' '));
-            };
-            const isVisible = (element) => {
-                if (!(element instanceof HTMLElement)) {
-                    return false;
-                }
-                const style = window.getComputedStyle(element);
-                const rect = element.getBoundingClientRect();
-                return style.visibility !== 'hidden'
-                    && style.display !== 'none'
-                    && rect.width > 0
-                    && rect.height > 0
-                    && !element.hasAttribute('disabled')
-                    && element.getAttribute('aria-disabled') !== 'true';
-            };
-            const isPointerReceivable = (element) => {
-                const rectangles = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
-                const targetRectangles = rectangles.length > 0 ? rectangles : [element.getBoundingClientRect()];
-                return targetRectangles.some((rect) => {
-                    const centerX = rect.left + rect.width / 2;
-                    const centerY = rect.top + rect.height / 2;
-                    const hitElement = document.elementFromPoint(centerX, centerY);
-                    return Boolean(hitElement && (element === hitElement || element.contains(hitElement) || hitElement.contains(element)));
-                });
-            };
-            const resolveXPathElement = (xpath) => {
-                if (!xpath) {
-                    return null;
-                }
-                try {
-                    return document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                } catch (error) {
-                    return null;
-                }
-            };
-            const configuredAdCloseButton = resolveXPathElement(adOverlayCloseButtonXPathValue);
-            if (configuredAdCloseButton instanceof HTMLElement && isVisible(configuredAdCloseButton)) {
-                return true;
+    remainingCountXPath: str | None = None,
+    insufficientPackHeadingXPathValue: str | None = None,
+    returnButtonXPath: str | None = None,
+    recoverPackButtonXPathValue: str | None = None,
+) -> dict[str, Any]:
+    while True:
+        adCloseResolution = resolveAdInterruptionCloseTarget(page, adOverlayCloseButtonXPathValue)
+        if adCloseResolution.get("ok"):
+            return {
+                "ok": True,
+                "outcomeType": "adCloseTargetAvailable",
+                "adCloseResolution": adCloseResolution,
             }
-            const bodyText = document.body ? getElementText(document.body) : '';
-            const hasAdInterruptionDialog = adInterruptionPatterns.some((pattern) => pattern.test(`${location.href} ${bodyText}`));
-            if (hasAdInterruptionDialog) {
-                const hasAdCloseAction = Array.from(document.querySelectorAll(actionableSelector))
-                    .filter((element) => element instanceof HTMLElement)
-                    .filter(isVisible)
-                    .some((element) => {
-                        const text = getElementText(element);
-                        return adCloseActionPatterns.some((pattern) => pattern.test(text))
-                            && !negativePatterns.some((pattern) => pattern.test(text));
-                    });
-                if (hasAdCloseAction) {
-                    return true;
-                }
+
+        rewardConfirmationResolution = resolveAdRewardConfirmationSelector(page, adRewardConfirmButtonXPathValue)
+        if rewardConfirmationResolution.get("ok"):
+            return {
+                "ok": True,
+                "outcomeType": "rewardConfirmationTargetAvailable",
+                "rewardConfirmationResolution": rewardConfirmationResolution,
             }
-            const configuredRewardButton = resolveXPathElement(adRewardConfirmButtonXPathValue);
-            if (configuredRewardButton instanceof HTMLElement && isVisible(configuredRewardButton) && isPointerReceivable(configuredRewardButton)) {
-                return true;
-            }
-            return Array.from(document.querySelectorAll(actionableSelector))
-                .filter((element) => element instanceof HTMLElement)
-                .filter(isVisible)
-                .filter(isPointerReceivable)
-                .some((element) => {
-                    const text = getElementText(element);
-                    return rewardConfirmationPatterns.some((pattern) => pattern.test(text))
-                        && !negativePatterns.some((pattern) => pattern.test(text));
-                });
-        }
-        """,
-        arg={
-            "adRewardConfirmButtonXPathValue": adRewardConfirmButtonXPathValue,
-            "adOverlayCloseButtonXPathValue": adOverlayCloseButtonXPathValue,
-        },
-        timeout=0,
-    )
+
+        if remainingCountXPath and insufficientPackHeadingXPathValue and returnButtonXPath and recoverPackButtonXPathValue:
+            packReadyOutcome = resolvePackReadyAfterAdRecoveryOutcome(
+                page,
+                remainingCountXPath,
+                insufficientPackHeadingXPathValue,
+                recoverPackButtonXPathValue,
+                returnButtonXPath,
+            )
+            if packReadyOutcome.get("ok"):
+                return packReadyOutcome
+
+        waitForAdOutcomeMutationOrPaint(page)
 
 
 def recoverFromAdInterruptionIfPresent(
@@ -2735,7 +3175,7 @@ def recoverFromAdInterruptionIfPresent(
     arguments: argparse.Namespace,
     drawIndex: int,
 ) -> bool:
-    adInterruptionResolution = resolveAdInterruptionCloseSelector(page, arguments.adOverlayCloseButtonXPath)
+    adInterruptionResolution = resolveAdInterruptionCloseTarget(page, arguments.adOverlayCloseButtonXPath)
     if not adInterruptionResolution.get("ok"):
         return False
 
@@ -2746,10 +3186,10 @@ def recoverFromAdInterruptionIfPresent(
 
     adInterruptionClickPayload = {
         "adInterruptionResolution": adInterruptionResolution,
-        **clickResolvedSelectorAndWait(
+        **clickResolvedAdCloseTargetAndWait(
             page,
-            adInterruptionResolution["selector"],
-            lambda: resolveAdInterruptionCloseSelector(page, arguments.adOverlayCloseButtonXPath),
+            adInterruptionResolution,
+            lambda: resolveAdInterruptionCloseTarget(page, arguments.adOverlayCloseButtonXPath),
         ),
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_interruption_closed", adInterruptionClickPayload)
@@ -2791,11 +3231,24 @@ def recoverFromInsufficientPackIfPresent(
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_insufficient_pack_recovery_clicked", recoveryClickPayload)
 
-    waitForAdRecoveryOutcomeTarget(
+    adRecoveryOutcome = waitForAdRecoveryOutcomeTarget(
         page,
         arguments.adRewardConfirmButtonXPath,
         arguments.adOverlayCloseButtonXPath,
+        arguments.remainingPackCountXPath,
+        arguments.insufficientPackHeadingXPath,
+        arguments.returnToPackPageXPath,
+        arguments.recoverPackButtonXPath,
     )
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_recovery_outcome_detected", adRecoveryOutcome)
+
+    if adRecoveryOutcome.get("outcomeType") in {
+        "remainingPackCountBecamePositive",
+        "packTargetBecameAvailable",
+        "insufficientPackRecoveryStillAvailable",
+    }:
+        print("[INFO] Ad recovery returned control to the pack page; resuming pack opening.")
+        return True
 
     if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
         return True
@@ -2827,6 +3280,105 @@ def recoverFromInsufficientPackIfPresent(
     return True
 
 
+
+def clickAdRewardConfirmationIfPresent(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    evidenceLabelPrefix: str,
+) -> bool:
+    confirmationResolution = resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath)
+    if not confirmationResolution.get("ok"):
+        return False
+
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_ad_reward_confirmation_target", confirmationResolution)
+    if arguments.dryRun:
+        print("[DRY-RUN] Ad-reward confirmation target resolved; confirmation click skipped.")
+        return True
+
+    confirmationClickPayload = {
+        "confirmationResolution": confirmationResolution,
+        **clickResolvedSelectorAndWait(
+            page,
+            confirmationResolution["selector"],
+            lambda: resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath),
+        ),
+    }
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_ad_reward_confirmation_clicked", confirmationClickPayload)
+    waitForRenderCycle(page)
+    print("[INFO] Ad-reward confirmation was clicked; resuming adaptive recovery.")
+    return True
+
+
+def recoverFromExpectedAdRecoveryOutcome(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    reason: str,
+) -> bool:
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_expected_ad_recovery_wait_started",
+        {
+            "reason": reason,
+            "adRewardConfirmButtonXPath": arguments.adRewardConfirmButtonXPath,
+            "adOverlayCloseButtonXPath": arguments.adOverlayCloseButtonXPath,
+        },
+    )
+    print(
+        "[INFO] Waiting for deferred ad close, reward-confirmation, or pack-page readiness "
+        "before deciding that the run is complete."
+    )
+    adRecoveryOutcome = waitForAdRecoveryOutcomeTarget(
+        page,
+        arguments.adRewardConfirmButtonXPath,
+        arguments.adOverlayCloseButtonXPath,
+        arguments.remainingPackCountXPath,
+        arguments.insufficientPackHeadingXPath,
+        arguments.returnToPackPageXPath,
+        arguments.recoverPackButtonXPath,
+    )
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_expected_ad_recovery_outcome_detected",
+        adRecoveryOutcome,
+    )
+
+    if adRecoveryOutcome.get("outcomeType") in {
+        "remainingPackCountBecamePositive",
+        "packTargetBecameAvailable",
+        "insufficientPackRecoveryStillAvailable",
+    }:
+        print("[INFO] Deferred ad recovery returned control to the pack page; resuming pack opening.")
+        return True
+
+    if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
+        return True
+
+    if clickAdRewardConfirmationIfPresent(
+        page,
+        evidencePath,
+        arguments,
+        drawIndex,
+        "expected_deferred",
+    ):
+        return True
+
+    missingOutcomePayload = {
+        "reason": reason,
+        "adInterruptionResolution": resolveAdInterruptionCloseTarget(page, arguments.adOverlayCloseButtonXPath),
+        "adRewardConfirmationResolution": resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath),
+    }
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_expected_ad_recovery_outcome_missing", missingOutcomePayload)
+    raise WikiGachaAutomationError(
+        "An ad-recovery outcome was expected and the adaptive wait returned, but neither an ad-close control nor "
+        "a reward-confirmation control could be resolved. Inspect the outcome evidence."
+    )
+
 def completePackOpening(
     page: Page,
     arguments: argparse.Namespace,
@@ -2834,15 +3386,18 @@ def completePackOpening(
     drawIndex: int,
     allowNoInitialTarget: bool,
     initialRemainingPackResolution: dict[str, Any],
+    expectDeferredAdRecoveryOutcome: bool = False,
 ) -> bool:
     seenOpeningStateHashes: set[str] = set()
     openingStepIndex = 0
     hasClickedOpeningTarget = False
+    shouldWaitForDeferredAdOutcome = expectDeferredAdRecoveryOutcome
 
     while True:
         if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
             if arguments.dryRun:
                 return True
+            shouldWaitForDeferredAdOutcome = True
             seenOpeningStateHashes.clear()
             waitForRenderCycle(page)
             continue
@@ -2918,9 +3473,29 @@ def completePackOpening(
             if recoveredAdInterruption:
                 if arguments.dryRun:
                     return True
+                shouldWaitForDeferredAdOutcome = True
                 seenOpeningStateHashes.clear()
                 waitForRenderCycle(page)
                 continue
+
+            if allowNoInitialTarget and not hasClickedOpeningTarget and shouldWaitForDeferredAdOutcome:
+                recoveredExpectedAdOutcome = recoverFromExpectedAdRecoveryOutcome(
+                    page,
+                    evidencePath,
+                    arguments,
+                    drawIndex,
+                    reason=(
+                        "No pack/card target was available immediately after an ad-interruption close; "
+                        "the rewarded-ad close or reward-confirmation control may still be deferred."
+                    ),
+                )
+                if recoveredExpectedAdOutcome:
+                    if arguments.dryRun:
+                        return True
+                    shouldWaitForDeferredAdOutcome = False
+                    seenOpeningStateHashes.clear()
+                    waitForRenderCycle(page)
+                    continue
 
             refreshedReturnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
             if refreshedReturnResolution.get("ok"):
@@ -3078,6 +3653,7 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
             arguments.insufficientPackHeadingXPath,
         )
         remainingPacksBeforeDraw = hasRemainingPacks(remainingPackResolutionBeforeDraw)
+        expectDeferredAdRecoveryOutcome = False
         saveEvidence(
             page,
             evidencePath,
@@ -3092,6 +3668,7 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
         if remainingPacksBeforeDraw is False:
             recoveredAdInterruption = recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex)
             if recoveredAdInterruption:
+                expectDeferredAdRecoveryOutcome = True
                 if arguments.dryRun:
                     saveEvidence(
                         page,
@@ -3124,6 +3701,7 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
 
             recoveredInsufficientPack = recoverFromInsufficientPackIfPresent(page, evidencePath, arguments, drawIndex)
             if recoveredInsufficientPack:
+                expectDeferredAdRecoveryOutcome = True
                 if arguments.dryRun:
                     saveEvidence(
                         page,
@@ -3189,6 +3767,7 @@ def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) 
             drawIndex,
             allowNoInitialTarget=allowNoInitialTarget,
             initialRemainingPackResolution=remainingPackResolutionBeforeDraw,
+            expectDeferredAdRecoveryOutcome=expectDeferredAdRecoveryOutcome,
         )
         remainingPackResolutionAfterDraw = resolveRemainingPackCount(
             page,
