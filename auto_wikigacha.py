@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,7 +82,16 @@ def parseArguments() -> argparse.Namespace:
         default=None,
         help=(
             "Execution mode override. Omit this option to choose interactively at startup: "
-            "press Enter or type 1 for Bot mode, type 2 for Manual mode."
+            "press Enter or type 1 for Bot mode, type 2 for Manual mode. "
+            "Manual mode launches an ordinary Chrome process instead of a Playwright-controlled browser."
+        ),
+    )
+    parser.add_argument(
+        "--externalChromePath",
+        default=None,
+        help=(
+            "Optional path to an installed Google Chrome executable used by Manual/setup mode. "
+            "When omitted, the script searches common Chrome executable locations and PATH."
         ),
     )
     parser.add_argument(
@@ -103,7 +115,10 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Open the site with the persistent profile and pause for manual Google sign-in / server-sync setup.",
+        help=(
+            "Open the site in an ordinary, non-Playwright-controlled Chrome process using the same persistent "
+            "profile directory, then pause for manual Google sign-in / server-sync setup."
+        ),
     )
     parser.add_argument(
         "--url",
@@ -215,7 +230,7 @@ def promptForExecutionMode() -> str:
     while True:
         print("\n請選擇執行模式：")
         print("  [1] Bot 模式：自動抽卡與自動處理廣告恢復流程")
-        print("  [2] Manual 模式：只開啟瀏覽器與網站，保留控制權給你手動操作")
+        print("  [2] Manual 模式：用一般 Chrome 開啟網站，給你手動登入 Google／伺服器同步")
         selectionText = input("請輸入模式數字後按 Enter；直接按 Enter 預設 Bot 模式：")
         executionMode = normalizeExecutionModeSelection(selectionText)
         if executionMode:
@@ -3989,37 +4004,128 @@ def recoverFromPossibleEntryGate(page: Page, evidencePath: Path, rememberDismiss
     return dismissEntryGates(page, evidencePath, rememberDismissal=rememberDismissal)
 
 
-def runManualMode(page: Page, arguments: argparse.Namespace, evidencePath: Path) -> None:
-    print("[INFO] Manual mode selected. The script will open the site and keep the browser available for manual control.")
-    page.goto(arguments.url)
-    waitForPageReady(page)
-    saveEvidence(
-        page,
-        evidencePath,
-        "manual_mode_ready",
-        {
-            "mode": "manual",
-            "url": arguments.url,
-            "profileDir": arguments.profileDir,
-            "message": "Browser is ready for manual operation; automated draw flow is intentionally disabled.",
-        },
+def getExternalChromeExecutableCandidates(arguments: argparse.Namespace) -> list[Path]:
+    candidateTexts: list[str] = []
+    if arguments.externalChromePath:
+        candidateTexts.append(arguments.externalChromePath)
+
+    pathCandidates = [
+        shutil.which("chrome"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+    ]
+    candidateTexts.extend(candidate for candidate in pathCandidates if candidate)
+
+    programFiles = [
+        os.environ.get("PROGRAMFILES"),
+        os.environ.get("PROGRAMFILES(X86)"),
+        os.environ.get("LOCALAPPDATA"),
+    ]
+    windowsChromeSuffixes = [
+        Path("Google") / "Chrome" / "Application" / "chrome.exe",
+        Path("Google") / "Chrome Beta" / "Application" / "chrome.exe",
+        Path("Google") / "Chrome Dev" / "Application" / "chrome.exe",
+        Path("Google") / "Chrome SxS" / "Application" / "chrome.exe",
+    ]
+    for basePathText in programFiles:
+        if not basePathText:
+            continue
+        basePath = Path(basePathText)
+        candidateTexts.extend(str(basePath / suffix) for suffix in windowsChromeSuffixes)
+
+    candidateTexts.extend(
+        [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+            "/Applications/Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+        ]
     )
+
+    candidates: list[Path] = []
+    seenCandidates: set[str] = set()
+    for candidateText in candidateTexts:
+        candidatePath = Path(candidateText).expanduser()
+        normalizedCandidate = str(candidatePath.resolve()) if candidatePath.exists() else str(candidatePath)
+        if normalizedCandidate in seenCandidates:
+            continue
+        seenCandidates.add(normalizedCandidate)
+        candidates.append(candidatePath)
+    return candidates
+
+
+def resolveExternalChromeExecutable(arguments: argparse.Namespace) -> Path:
+    candidates = getExternalChromeExecutableCandidates(arguments)
+    for candidatePath in candidates:
+        if candidatePath.is_file():
+            return candidatePath
+    searchedLocations = "\n".join(f"  - {candidate}" for candidate in candidates)
+    raise WikiGachaAutomationError(
+        "找不到可用的一般 Google Chrome / Chromium 執行檔，因此無法啟動 Manual/setup 登入模式。\n"
+        "請安裝 Chrome，或用 --externalChromePath 指定 chrome.exe / Google Chrome 執行檔位置。\n"
+        f"已搜尋位置：\n{searchedLocations}"
+    )
+
+
+def buildExternalChromeCommand(
+    chromeExecutablePath: Path,
+    profilePath: Path,
+    targetUrl: str,
+) -> list[str]:
+    return [
+        str(chromeExecutablePath),
+        f"--user-data-dir={profilePath.resolve()}",
+        "--profile-directory=Default",
+        "--no-first-run",
+        "--new-window",
+        targetUrl,
+    ]
+
+
+def launchExternalChromeForManualControl(
+    arguments: argparse.Namespace,
+    profilePath: Path,
+    targetUrl: str,
+    modeLabel: str,
+) -> subprocess.Popen[Any]:
+    chromeExecutablePath = resolveExternalChromeExecutable(arguments)
+    command = buildExternalChromeCommand(chromeExecutablePath, profilePath, targetUrl)
+    print(f"[INFO] {modeLabel} 使用一般瀏覽器，不經由 Playwright 控制：{chromeExecutablePath}")
+    print(f"[INFO] 使用同一個持久化 profile：{profilePath.resolve()}")
+    print("[INFO] 這個模式不會出現『Chrome 目前受到自動測試軟體控制』，適合手動 Google 登入與伺服器同步。")
+    return subprocess.Popen(command)
+
+
+def runExternalManualMode(arguments: argparse.Namespace, profilePath: Path) -> None:
+    print("[INFO] Manual mode selected. The script will launch ordinary Chrome for manual control.")
+    browserProcess = launchExternalChromeForManualControl(arguments, profilePath, arguments.url, "Manual 模式")
     if sys.stdin.isatty():
-        input("[INFO] Manual 模式已啟動。完成手動操作後，請在此視窗按 Enter 關閉瀏覽器。")
+        print("[INFO] 請在開啟的一般 Chrome 視窗中操作 WikiGacha、登入 Google、啟用伺服器同步。")
+        print("[INFO] 完成後請先關閉 Chrome 視窗，再回到此終端機按 Enter。")
+        input("[INFO] Manual 模式已啟動；按 Enter 結束等待：")
+        if browserProcess.poll() is None:
+            print("[INFO] 一般 Chrome 仍在執行；腳本不會強制關閉它，以免中斷登入狀態寫入。")
     else:
-        print("[INFO] Manual mode cannot wait for an Enter key because stdin is non-interactive; closing browser context.")
+        print("[INFO] stdin 非互動模式；已啟動一般 Chrome 後直接返回。")
 
 
-def runSetup(page: Page, targetUrl: str, evidencePath: Path, rememberDismissal: bool) -> None:
-    page.goto(targetUrl, wait_until="domcontentloaded", timeout=0)
-    waitForPageReady(page)
-    dismissedGates = dismissEntryGates(page, evidencePath, rememberDismissal=rememberDismissal)
-    print("[SETUP] 已嘗試自動處理入口／更新通知層。")
-    print(f"[SETUP] Dismissed gate count: {len(dismissedGates)}")
-    print("[SETUP] 請在開啟的瀏覽器中完成 Google 登入，並於站內手動啟用 server sync。")
-    print("[SETUP] 完成後回到終端機按 Enter；這個持久化 profile 會在後續執行中沿用。")
-    input()
-    saveEvidence(page, evidencePath, "setup_complete", {"mode": "setup", "dismissedGates": dismissedGates})
+def runExternalGoogleSignInSetup(arguments: argparse.Namespace, profilePath: Path) -> None:
+    print("[SETUP] Google 登入／伺服器同步設定模式將使用一般 Chrome，而不是自動化控制中的瀏覽器。")
+    browserProcess = launchExternalChromeForManualControl(arguments, profilePath, arguments.url, "Setup 模式")
+    if sys.stdin.isatty():
+        print("[SETUP] 請在一般 Chrome 內點『伺服器同步』並完成 Google 登入。")
+        print("[SETUP] 成功登入後，請先關閉一般 Chrome 視窗，讓 profile 狀態完整寫入磁碟。")
+        input("[SETUP] 完成後回到終端機按 Enter；後續 Bot 模式會沿用這個 profile：")
+        if browserProcess.poll() is None:
+            print("[SETUP] 一般 Chrome 仍在執行；腳本不會強制關閉它。請確認關閉後再啟動 Bot，避免 profile 被鎖定。")
+    else:
+        print("[SETUP] stdin 非互動模式；已啟動一般 Chrome 後直接返回。")
 
 
 def performDraws(page: Page, arguments: argparse.Namespace, evidencePath: Path) -> None:
@@ -4302,16 +4408,19 @@ def main() -> int:
     profilePath = Path(arguments.profileDir)
     profilePath.mkdir(parents=True, exist_ok=True)
 
+    if arguments.setup:
+        runExternalGoogleSignInSetup(arguments, profilePath)
+        return 0
+
+    if arguments.executionMode == "manual":
+        runExternalManualMode(arguments, profilePath)
+        return 0
+
     with sync_playwright() as playwright:
         context = launchPersistentContext(playwright, arguments, profilePath)
         page = context.pages[0] if context.pages else context.new_page()
         try:
-            if arguments.setup:
-                runSetup(page, arguments.url, evidencePath, rememberDismissal=not arguments.keepEntryNotices)
-            elif arguments.executionMode == "manual":
-                runManualMode(page, arguments, evidencePath)
-            else:
-                performDraws(page, arguments, evidencePath)
+            performDraws(page, arguments, evidencePath)
         except Exception as error:
             try:
                 saveErrorEvidence(page, evidencePath, error, arguments)
