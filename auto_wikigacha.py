@@ -74,6 +74,15 @@ def parseArguments() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--executionMode",
+        choices=("bot", "manual"),
+        default=None,
+        help=(
+            "Execution mode override. Omit this option to choose interactively at startup: "
+            "press Enter or type 1 for Bot mode, type 2 for Manual mode."
+        ),
+    )
+    parser.add_argument(
         "--headed",
         action="store_true",
         help="Compatibility flag. The browser is visible by default; use --headless to hide it.",
@@ -183,6 +192,41 @@ def getDrawRunMode(arguments: argparse.Namespace) -> str:
     if arguments.drawCount is None:
         return "untilRemainingPackCountIsZero"
     return "boundedDrawCountWithRemainingPackGuard"
+
+
+def normalizeExecutionModeSelection(selectionText: str) -> str | None:
+    normalizedSelection = selectionText.strip().lower()
+    if normalizedSelection == "":
+        return "bot"
+    botSelections = {"1", "bot", "b", "auto", "automatic", "自動", "自動模式"}
+    manualSelections = {"2", "manual", "m", "手動", "手動模式"}
+    if normalizedSelection in botSelections:
+        return "bot"
+    if normalizedSelection in manualSelections:
+        return "manual"
+    return None
+
+
+def promptForExecutionMode() -> str:
+    if not sys.stdin.isatty():
+        print("[INFO] No interactive stdin was detected; defaulting to Bot mode.")
+        return "bot"
+
+    while True:
+        print("\n請選擇執行模式：")
+        print("  [1] Bot 模式：自動抽卡與自動處理廣告恢復流程")
+        print("  [2] Manual 模式：只開啟瀏覽器與網站，保留控制權給你手動操作")
+        selectionText = input("請輸入模式數字後按 Enter；直接按 Enter 預設 Bot 模式：")
+        executionMode = normalizeExecutionModeSelection(selectionText)
+        if executionMode:
+            return executionMode
+        print("[WARN] 無法辨識模式選擇。請輸入 1、2，或直接按 Enter 使用 Bot 模式。", file=sys.stderr)
+
+
+def resolveExecutionMode(arguments: argparse.Namespace) -> str:
+    if arguments.executionMode:
+        return arguments.executionMode
+    return promptForExecutionMode()
 
 
 def createEvidenceDirectory(evidenceDir: str, shouldCreateImmediately: bool = False) -> Path:
@@ -3945,6 +3989,27 @@ def recoverFromPossibleEntryGate(page: Page, evidencePath: Path, rememberDismiss
     return dismissEntryGates(page, evidencePath, rememberDismissal=rememberDismissal)
 
 
+def runManualMode(page: Page, arguments: argparse.Namespace, evidencePath: Path) -> None:
+    print("[INFO] Manual mode selected. The script will open the site and keep the browser available for manual control.")
+    page.goto(arguments.url)
+    waitForPageReady(page)
+    saveEvidence(
+        page,
+        evidencePath,
+        "manual_mode_ready",
+        {
+            "mode": "manual",
+            "url": arguments.url,
+            "profileDir": arguments.profileDir,
+            "message": "Browser is ready for manual operation; automated draw flow is intentionally disabled.",
+        },
+    )
+    if sys.stdin.isatty():
+        input("[INFO] Manual 模式已啟動。完成手動操作後，請在此視窗按 Enter 關閉瀏覽器。")
+    else:
+        print("[INFO] Manual mode cannot wait for an Enter key because stdin is non-interactive; closing browser context.")
+
+
 def runSetup(page: Page, targetUrl: str, evidencePath: Path, rememberDismissal: bool) -> None:
     page.goto(targetUrl, wait_until="domcontentloaded", timeout=0)
     waitForPageReady(page)
@@ -4226,6 +4291,9 @@ def launchPersistentContext(playwright: Any, arguments: argparse.Namespace, prof
 def main() -> int:
     arguments = parseArguments()
     ensureArgumentsAreValid(arguments)
+    executionMode = resolveExecutionMode(arguments)
+    arguments.executionMode = executionMode
+    print(f"[INFO] Execution mode: {executionMode}")
     setRoutineEvidenceEnabled(arguments.saveRoutineEvidence)
     evidencePath = createEvidenceDirectory(
         arguments.evidenceDir,
@@ -4240,6 +4308,8 @@ def main() -> int:
         try:
             if arguments.setup:
                 runSetup(page, arguments.url, evidencePath, rememberDismissal=not arguments.keepEntryNotices)
+            elif arguments.executionMode == "manual":
+                runManualMode(page, arguments, evidencePath)
             else:
                 performDraws(page, arguments, evidencePath)
         except Exception as error:
