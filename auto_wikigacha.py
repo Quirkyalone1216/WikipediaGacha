@@ -208,6 +208,26 @@ def parseArguments() -> argparse.Namespace:
             "the requested forty-second operational boundary; tune this value instead of editing control-flow code."
         ),
     )
+    parser.add_argument(
+        "--googleRewardedAdCloseSettlingSeconds",
+        type=float,
+        default=10.0,
+        help=(
+            "Observed post-click settling window for Google rewarded-ad close controls such as "
+            "reward_close_button_widget / close_button / close_button_icon. The default follows the requested "
+            "ten-second operational pause, while keeping the value configurable instead of hard-coding it in "
+            "the recovery control flow."
+        ),
+    )
+    parser.add_argument(
+        "--keepBrowserOpenAfterAdaptiveCompletion",
+        action="store_true",
+        help=(
+            "Compatibility switch. By default, an unbounded adaptive run that reaches the completion state closes "
+            "the current automated Chrome page/context and starts a fresh bot lifecycle. Enable this flag only when "
+            "you explicitly want the old passive behavior of keeping the completed browser open."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -216,6 +236,8 @@ def ensureArgumentsAreValid(arguments: argparse.Namespace) -> None:
         raise ValueError("--drawCount 必須大於 0。")
     if arguments.adInterruptionRecoveryRestartSeconds <= 0:
         raise ValueError("--adInterruptionRecoveryRestartSeconds 必須大於 0。")
+    if arguments.googleRewardedAdCloseSettlingSeconds < 0:
+        raise ValueError("--googleRewardedAdCloseSettlingSeconds 不可小於 0。")
 
 
 def formatDrawProgress(drawIndex: int, drawCount: int | None) -> str:
@@ -3644,6 +3666,135 @@ def waitForAdOutcomeMutationOrPaint(page: Page) -> None:
     )
 
 
+def shouldObserveAfterGoogleRewardedAdClose(adInterruptionResolution: dict[str, Any]) -> bool:
+    selectedResolution = adInterruptionResolution.get("selected", {})
+    if not isinstance(selectedResolution, dict):
+        return False
+
+    selectedSource = str(selectedResolution.get("source") or "")
+    selectedId = str(selectedResolution.get("id") or "")
+    selectedClassName = str(selectedResolution.get("className") or "")
+    selectedText = str(selectedResolution.get("text") or "")
+    selectedSelector = str(adInterruptionResolution.get("selector") or "")
+    combinedTargetText = " ".join(
+        [
+            selectedSource,
+            selectedId,
+            selectedClassName,
+            selectedText,
+            selectedSelector,
+            str(selectedResolution.get("ariaLabel") or ""),
+        ]
+    ).lower()
+
+    primaryEvidence = selectedResolution.get("primaryRewardedCloseEvidence", 0)
+    rewardedFrameEvidence = selectedResolution.get("isPrimaryRewardedCloseButton", False)
+    rewardPendingEvidence = selectedResolution.get("rewardPendingEvidence", 0)
+    return (
+        selectedSource == "googleRewardedFrameCloseButton"
+        or bool(rewardedFrameEvidence)
+        or (isinstance(primaryEvidence, int) and primaryEvidence > 0)
+        or (isinstance(rewardPendingEvidence, int) and rewardPendingEvidence > 0)
+        or "reward_close_button_widget" in combinedTargetText
+        or "close_button_icon" in combinedTargetText
+        or "close_button" in combinedTargetText
+        or "關閉影片" in combinedTargetText
+        or "关闭影片" in combinedTargetText
+        or "close video" in combinedTargetText
+    )
+
+
+def waitForGoogleRewardedAdCloseSettlingWindow(page: Page, settlingSeconds: float) -> dict[str, Any]:
+    if settlingSeconds <= 0:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "googleRewardedAdCloseSettlingSecondsIsZero",
+            "requestedSettlingSeconds": settlingSeconds,
+        }
+
+    return page.evaluate(
+        r"""
+        (settlingSeconds) => new Promise((resolve) => {
+            const requestedSettlingSeconds = Number(settlingSeconds);
+            const requestedSettlingMilliseconds = Math.max(0, requestedSettlingSeconds * 1000);
+            const startedAtPerformanceNow = performance.now();
+            const startedAtIso = new Date().toISOString();
+            let mutationCount = 0;
+            let animationFrameCount = 0;
+            let resolved = false;
+
+            const summarizeDocumentState = () => ({
+                href: location.href,
+                title: document.title,
+                readyState: document.readyState,
+                visibilityState: document.visibilityState,
+                bodyTextSample: document.body ? String(document.body.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 1000) : '',
+            });
+
+            const initialDocumentState = summarizeDocumentState();
+            const observer = document.documentElement
+                ? new MutationObserver((mutations) => {
+                    mutationCount += mutations.length;
+                })
+                : null;
+
+            const finish = (settledBy) => {
+                if (resolved) {
+                    return;
+                }
+                resolved = true;
+                if (observer) {
+                    observer.disconnect();
+                }
+                window.requestAnimationFrame(() => {
+                    window.requestAnimationFrame(() => {
+                        const completedAtPerformanceNow = performance.now();
+                        resolve({
+                            ok: true,
+                            skipped: false,
+                            requestedSettlingSeconds,
+                            observedSettlingSeconds: (completedAtPerformanceNow - startedAtPerformanceNow) / 1000,
+                            startedAtIso,
+                            completedAtIso: new Date().toISOString(),
+                            mutationCount,
+                            animationFrameCount,
+                            settledBy,
+                            initialDocumentState,
+                            finalDocumentState: summarizeDocumentState(),
+                        });
+                    });
+                });
+            };
+
+            if (observer && document.documentElement) {
+                observer.observe(document.documentElement, {
+                    attributes: true,
+                    childList: true,
+                    characterData: true,
+                    subtree: true,
+                });
+            }
+
+            const timeoutIdentifier = window.setTimeout(() => {
+                finish('observedSettlingWindowElapsed');
+            }, requestedSettlingMilliseconds);
+
+            const observeFrame = () => {
+                if (resolved) {
+                    window.clearTimeout(timeoutIdentifier);
+                    return;
+                }
+                animationFrameCount += 1;
+                window.requestAnimationFrame(observeFrame);
+            };
+            window.requestAnimationFrame(observeFrame);
+        })
+        """,
+        settlingSeconds,
+    )
+
+
 
 def resolvePackReadyAfterAdRecoveryOutcome(
     page: Page,
@@ -3760,6 +3911,26 @@ def recoverFromAdInterruptionIfPresent(
             lambda: resolveAdInterruptionCloseTarget(page, arguments.adOverlayCloseButtonXPath),
         ),
     }
+    if shouldObserveAfterGoogleRewardedAdClose(adInterruptionResolution):
+        print(
+            "[INFO] Google rewarded-ad close button was clicked; observing the requested post-close "
+            f"settling window for {arguments.googleRewardedAdCloseSettlingSeconds:g} seconds before continuing."
+        )
+        postCloseSettlingObservation = waitForGoogleRewardedAdCloseSettlingWindow(
+            page,
+            arguments.googleRewardedAdCloseSettlingSeconds,
+        )
+        adInterruptionClickPayload["postGoogleRewardedAdCloseSettlingObservation"] = postCloseSettlingObservation
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_google_rewarded_ad_close_settled",
+            {
+                "adInterruptionResolution": adInterruptionResolution,
+                "postCloseSettlingObservation": postCloseSettlingObservation,
+            },
+        )
+
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_interruption_closed", adInterruptionClickPayload)
     waitForRenderCycle(page)
     recordAdInterruptionRecoveryAndRestartIfStalled(
@@ -4672,6 +4843,44 @@ def waitForBotLifecycleClosure(page: Page | None, context: BrowserContext | None
             raise
 
 
+def buildAdaptiveCompletionRestartPayload(page: Page, arguments: argparse.Namespace) -> dict[str, Any]:
+    renderedStateFingerprint = getRenderedStateFingerprint(page)
+    return {
+        "reason": (
+            "The unbounded adaptive draw run reached its page-observed completion state. "
+            "The current automated Chrome page/context will be closed and a fresh bot lifecycle will be started."
+        ),
+        "url": page.url,
+        "drawRunMode": getDrawRunMode(arguments),
+        "profileDir": arguments.profileDir,
+        "pageStateFingerprintHash": buildShortHash(getPageStateFingerprint(page)),
+        "renderedStateFingerprintHash": buildShortHash(renderedStateFingerprint),
+        "routineEvidencePersisted": saveRoutineEvidence,
+        "evidenceEventTrail": evidenceEventTrail,
+    }
+
+
+def requestBotLifecycleRestartAfterAdaptiveCompletion(
+    page: Page | None,
+    context: BrowserContext | None,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+) -> None:
+    if arguments.keepBrowserOpenAfterAdaptiveCompletion:
+        waitForBotLifecycleClosure(page, context)
+        return
+
+    if page is not None and not page.is_closed():
+        restartPayload = buildAdaptiveCompletionRestartPayload(page, arguments)
+        saveEvidence(page, evidencePath, "adaptive_completion_lifecycle_restart_requested", restartPayload)
+
+    print(
+        "[INFO] Bot lifecycle completed; closing the current automated Chrome page/context "
+        "and restarting from a fresh browser lifecycle."
+    )
+    closePageQuietly(page)
+
+
 def runBotLifecycle(
     playwright: Any,
     arguments: argparse.Namespace,
@@ -4689,7 +4898,7 @@ def runBotLifecycle(
         performDraws(page, arguments, evidencePath)
         if arguments.drawCount is not None:
             return False
-        waitForBotLifecycleClosure(page, context)
+        requestBotLifecycleRestartAfterAdaptiveCompletion(page, context, evidencePath, arguments)
         return True
     except KeyboardInterrupt:
         raise
