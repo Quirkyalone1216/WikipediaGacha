@@ -213,10 +213,10 @@ def parseArguments() -> argparse.Namespace:
         type=float,
         default=10.0,
         help=(
-            "Observed post-click settling window for Google rewarded-ad close controls such as "
+            "Observed pre-click and post-click settling window for Google rewarded-ad close controls such as "
             "reward_close_button_widget / close_button / close_button_icon. The default follows the requested "
-            "ten-second operational pause, while keeping the value configurable instead of hard-coding it in "
-            "the recovery control flow."
+            "ten-second operational pause on both sides of the close action, while keeping the value configurable "
+            "instead of hard-coding it in the recovery control flow."
         ),
     )
     parser.add_argument(
@@ -3666,7 +3666,7 @@ def waitForAdOutcomeMutationOrPaint(page: Page) -> None:
     )
 
 
-def shouldObserveAfterGoogleRewardedAdClose(adInterruptionResolution: dict[str, Any]) -> bool:
+def shouldObserveAroundGoogleRewardedAdClose(adInterruptionResolution: dict[str, Any]) -> bool:
     selectedResolution = adInterruptionResolution.get("selected", {})
     if not isinstance(selectedResolution, dict):
         return False
@@ -3704,18 +3704,19 @@ def shouldObserveAfterGoogleRewardedAdClose(adInterruptionResolution: dict[str, 
     )
 
 
-def waitForGoogleRewardedAdCloseSettlingWindow(page: Page, settlingSeconds: float) -> dict[str, Any]:
+def waitForGoogleRewardedAdCloseSettlingWindow(page: Page, settlingSeconds: float, settlingPhase: str) -> dict[str, Any]:
     if settlingSeconds <= 0:
         return {
             "ok": True,
             "skipped": True,
             "reason": "googleRewardedAdCloseSettlingSecondsIsZero",
+            "settlingPhase": settlingPhase,
             "requestedSettlingSeconds": settlingSeconds,
         }
 
     return page.evaluate(
         r"""
-        (settlingSeconds) => new Promise((resolve) => {
+        ({ settlingSeconds, settlingPhase }) => new Promise((resolve) => {
             const requestedSettlingSeconds = Number(settlingSeconds);
             const requestedSettlingMilliseconds = Math.max(0, requestedSettlingSeconds * 1000);
             const startedAtPerformanceNow = performance.now();
@@ -3754,6 +3755,7 @@ def waitForGoogleRewardedAdCloseSettlingWindow(page: Page, settlingSeconds: floa
                             ok: true,
                             skipped: false,
                             requestedSettlingSeconds,
+                            settlingPhase,
                             observedSettlingSeconds: (completedAtPerformanceNow - startedAtPerformanceNow) / 1000,
                             startedAtIso,
                             completedAtIso: new Date().toISOString(),
@@ -3791,7 +3793,7 @@ def waitForGoogleRewardedAdCloseSettlingWindow(page: Page, settlingSeconds: floa
             window.requestAnimationFrame(observeFrame);
         })
         """,
-        settlingSeconds,
+        {"settlingSeconds": settlingSeconds, "settlingPhase": settlingPhase},
     )
 
 
@@ -3903,15 +3905,38 @@ def recoverFromAdInterruptionIfPresent(
         print("[DRY-RUN] Ad-interruption close target resolved; close click skipped.")
         return True
 
+    shouldObserveGoogleRewardedAdClose = shouldObserveAroundGoogleRewardedAdClose(adInterruptionResolution)
+    preCloseSettlingObservation: dict[str, Any] | None = None
+    if shouldObserveGoogleRewardedAdClose:
+        print(
+            "[INFO] Google rewarded-ad close button was resolved; observing the requested pre-close "
+            f"settling window for {arguments.googleRewardedAdCloseSettlingSeconds:g} seconds before clicking."
+        )
+        preCloseSettlingObservation = waitForGoogleRewardedAdCloseSettlingWindow(
+            page,
+            arguments.googleRewardedAdCloseSettlingSeconds,
+            "preClose",
+        )
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_google_rewarded_ad_close_pre_settled",
+            {
+                "adInterruptionResolution": adInterruptionResolution,
+                "preCloseSettlingObservation": preCloseSettlingObservation,
+            },
+        )
+
     adInterruptionClickPayload = {
         "adInterruptionResolution": adInterruptionResolution,
+        "preGoogleRewardedAdCloseSettlingObservation": preCloseSettlingObservation,
         **clickResolvedAdCloseTargetAndWait(
             page,
             adInterruptionResolution,
             lambda: resolveAdInterruptionCloseTarget(page, arguments.adOverlayCloseButtonXPath),
         ),
     }
-    if shouldObserveAfterGoogleRewardedAdClose(adInterruptionResolution):
+    if shouldObserveGoogleRewardedAdClose:
         print(
             "[INFO] Google rewarded-ad close button was clicked; observing the requested post-close "
             f"settling window for {arguments.googleRewardedAdCloseSettlingSeconds:g} seconds before continuing."
@@ -3919,14 +3944,16 @@ def recoverFromAdInterruptionIfPresent(
         postCloseSettlingObservation = waitForGoogleRewardedAdCloseSettlingWindow(
             page,
             arguments.googleRewardedAdCloseSettlingSeconds,
+            "postClose",
         )
         adInterruptionClickPayload["postGoogleRewardedAdCloseSettlingObservation"] = postCloseSettlingObservation
         saveEvidence(
             page,
             evidencePath,
-            f"draw_{drawIndex:03d}_google_rewarded_ad_close_settled",
+            f"draw_{drawIndex:03d}_google_rewarded_ad_close_post_settled",
             {
                 "adInterruptionResolution": adInterruptionResolution,
+                "preCloseSettlingObservation": preCloseSettlingObservation,
                 "postCloseSettlingObservation": postCloseSettlingObservation,
             },
         )
