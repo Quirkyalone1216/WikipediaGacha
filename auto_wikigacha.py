@@ -2061,6 +2061,17 @@ def hasRemainingPacks(remainingPackResolution: dict[str, Any]) -> bool | None:
         return None
     return remainingPackCount > 0
 
+
+def isResultPageTargetSuppression(targetResolution: dict[str, Any]) -> bool:
+    if targetResolution.get("ok"):
+        return False
+    pageResultEvidence = targetResolution.get("pageResultEvidence")
+    if isinstance(pageResultEvidence, int) and pageResultEvidence > 0:
+        return True
+    reason = str(targetResolution.get("reason", ""))
+    return "Result-page controls were detected" in reason
+
+
 def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[str, Any]:
     return evaluatePageWithNavigationRecovery(page,
         r"""
@@ -2100,6 +2111,12 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                 /遊戲說明|游戏说明|help|rule/iu,
                 /privacy|policy|terms|contact/iu,
                 /隱私|隐私|條款|条款|聯絡|联系|お問い合わせ/iu,
+            ];
+            const resultPageEvidencePatterns = [
+                ...resultUtilityPatterns,
+                /左右滑動|左右滑动|使用\s*<>\s*翻頁|使用\s*<>\s*翻页/iu,
+                /內容遵循|内容遵循|Wikipedia 作者所有|ATK|DEF/iu,
+                /opened\s*(?:pack|card)|revealed\s*(?:pack|card)/iu,
             ];
             const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -2189,6 +2206,7 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                     returnEvidence: evidence.returnEvidence,
                     resultUtilityEvidence: evidence.resultUtilityEvidence,
                     navigationNegativeEvidence: evidence.navigationNegativeEvidence,
+                    resultPageEvidence: evidence.resultPageEvidence,
                     pointerReceivable: isPointerReceivable(element),
                     actionable: isActionable(element),
                     cursor: style.cursor,
@@ -2203,6 +2221,7 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                     returnEvidence: getEvidenceCount(returnPatterns, text),
                     resultUtilityEvidence: getEvidenceCount(resultUtilityPatterns, text),
                     navigationNegativeEvidence: getEvidenceCount(navigationNegativePatterns, text),
+                    resultPageEvidence: 0,
                 };
                 return {
                     element,
@@ -2214,10 +2233,16 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                 };
             };
 
+            const visibleBodyText = document.body ? getNormalizedText(document.body) : '';
+            const pageResultEvidence = getEvidenceCount(resultPageEvidencePatterns, visibleBodyText);
             const configuredElement = resolveXPathElement(returnButtonXPath);
             const configuredCandidate = configuredElement instanceof HTMLElement
                 ? buildCandidate(configuredElement, `${markerPrefix}-configured-xpath`, 'configuredXPath')
                 : null;
+            if (configuredCandidate) {
+                configuredCandidate.resultPageEvidence = pageResultEvidence;
+                configuredCandidate.summary.resultPageEvidence = pageResultEvidence;
+            }
 
             const semanticCandidates = Array.from(document.querySelectorAll(semanticCandidateSelector))
                 .filter((element) => element instanceof HTMLElement)
@@ -2230,7 +2255,13 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                 })
                 .filter((candidate) => isVisible(candidate.element))
                 .filter((candidate) => candidate.summary.actionable)
-                .filter((candidate) => candidate.returnEvidence > 0)
+                .filter((candidate) => {
+                    const configuredResultPageFallback = candidate.source === 'configuredXPath'
+                        && pageResultEvidence > 0
+                        && candidate.resultUtilityEvidence === 0
+                        && candidate.navigationNegativeEvidence === 0;
+                    return candidate.returnEvidence > 0 || configuredResultPageFallback;
+                })
                 .filter((candidate) => candidate.navigationNegativeEvidence === 0)
                 .sort((left, right) => {
                     const comparisons = [
@@ -2252,9 +2283,10 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
             if (candidates.length === 0) {
                 return {
                     ok: false,
-                    reason: 'No visible semantic return-to-pack-page button was found. Configured XPath is not trusted unless its own text matches a return-to-pack action.',
+                    reason: 'No visible return-to-pack-page button was found. The configured XPath is additionally trusted when the rendered page has result-page evidence, but no such actionable configured target was available.',
                     configuredXPath: returnButtonXPath,
                     configuredXPathResolved: configuredElement instanceof HTMLElement,
+                    pageResultEvidence,
                     rejectedConfiguredElement,
                     candidates: [configuredCandidate, ...semanticCandidates]
                         .filter(Boolean)
@@ -2271,6 +2303,10 @@ def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[
                 selector: `[data-auto-wikigacha-return="${selectedCandidate.marker}"]`,
                 selected: selectedCandidate.summary,
                 rejectedConfiguredElement,
+                pageResultEvidence,
+                configuredResultPageFallbackUsed: selectedCandidate.source === 'configuredXPath'
+                    && selectedCandidate.returnEvidence === 0
+                    && pageResultEvidence > 0,
                 candidates: candidates.map((candidate) => candidate.summary),
             };
         }
@@ -4466,12 +4502,13 @@ def resolvePackReadyAfterAdRecoveryOutcome(
         remainingCountXPath,
         insufficientPackHeadingXPathValue,
     )
-    remainingPackCount = getRemainingPackCountValue(remainingPackResolution)
-    if isinstance(remainingPackCount, int) and remainingPackCount > 0:
+    returnResolution = resolveReturnToPackPageSelector(page, returnButtonXPath)
+    if returnResolution.get("ok"):
         return {
             "ok": True,
-            "outcomeType": "remainingPackCountBecamePositive",
+            "outcomeType": "returnToPackPageTargetAvailable",
             "remainingPackResolution": remainingPackResolution,
+            "returnResolution": returnResolution,
         }
 
     drawTargetResolution = resolveDrawTargetSelector(page, returnButtonXPath)
@@ -4480,6 +4517,7 @@ def resolvePackReadyAfterAdRecoveryOutcome(
             "ok": True,
             "outcomeType": "packTargetBecameAvailable",
             "remainingPackResolution": remainingPackResolution,
+            "returnResolution": returnResolution,
             "drawTargetResolution": drawTargetResolution,
         }
 
@@ -4493,18 +4531,35 @@ def resolvePackReadyAfterAdRecoveryOutcome(
             "ok": True,
             "outcomeType": "insufficientPackRecoveryStillAvailable",
             "remainingPackResolution": remainingPackResolution,
+            "returnResolution": returnResolution,
             "drawTargetResolution": drawTargetResolution,
             "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
         }
 
+    remainingPackCount = getRemainingPackCountValue(remainingPackResolution)
+    remainingCountIsPositive = isinstance(remainingPackCount, int) and remainingPackCount > 0
+    if remainingCountIsPositive and not isResultPageTargetSuppression(drawTargetResolution):
+        return {
+            "ok": True,
+            "outcomeType": "remainingPackCountBecamePositive",
+            "remainingPackResolution": remainingPackResolution,
+            "returnResolution": returnResolution,
+            "drawTargetResolution": drawTargetResolution,
+            "readinessBasis": "remainingPackCounterOnlyAfterResultPageSuppressionWasExcluded",
+        }
+
     return {
         "ok": False,
-        "reason": "No post-ad pack-ready state was resolved yet.",
+        "reason": (
+            "No post-ad actionable pack-ready state was resolved yet. The remaining-pack counter alone is not "
+            "treated as proof of pack-page readiness when result-page controls are still detected."
+        ),
         "remainingPackResolution": remainingPackResolution,
+        "returnResolution": returnResolution,
         "drawTargetResolution": drawTargetResolution,
-        "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+        "remainingCountIsPositive": remainingCountIsPositive,
+        "resultPageSuppressionDetected": isResultPageTargetSuppression(drawTargetResolution),
     }
-
 
 def waitForAdRecoveryOutcomeTarget(
     page: Page,
@@ -4628,6 +4683,89 @@ def recoverFromAdInterruptionIfPresent(
     return True
 
 
+def clickReturnToPackPageOutcomeIfPresent(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    adRecoveryOutcome: dict[str, Any],
+    evidenceLabelPrefix: str,
+) -> bool:
+    if adRecoveryOutcome.get("outcomeType") != "returnToPackPageTargetAvailable":
+        return False
+
+    returnResolution = adRecoveryOutcome.get("returnResolution")
+    if not isinstance(returnResolution, dict) or not returnResolution.get("ok"):
+        returnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
+    if not returnResolution.get("ok"):
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_return_to_pack_missing_after_outcome",
+            {
+                "adRecoveryOutcome": adRecoveryOutcome,
+                "returnResolution": returnResolution,
+            },
+        )
+        return False
+
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_return_to_pack_target",
+        {
+            "adRecoveryOutcome": adRecoveryOutcome,
+            "returnResolution": returnResolution,
+        },
+    )
+    if arguments.dryRun:
+        print("[DRY-RUN] Ad-recovery return-to-pack target resolved; return click skipped.")
+        return True
+
+    returnPayload = {
+        "adRecoveryOutcome": adRecoveryOutcome,
+        "returnResolution": returnResolution,
+        **clickResolvedSelectorAndWait(
+            page,
+            returnResolution["selector"],
+            lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+        ),
+    }
+    if not returnPayload.get("stateChanged"):
+        returnPayload["refreshedReturnResolution"] = resolveReturnToPackPageSelector(
+            page,
+            arguments.returnToPackPageXPath,
+        )
+        returnPayload["refreshedDrawTargetResolution"] = resolveDrawTargetSelector(
+            page,
+            arguments.returnToPackPageXPath,
+        )
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_return_to_pack_no_change",
+            returnPayload,
+        )
+        if returnPayload["refreshedDrawTargetResolution"].get("ok"):
+            resetAdaptiveAdInterruptionRecoveryState("returnOutcomeAlreadyReachedPackPage")
+            print("[INFO] Ad recovery already exposed a pack target after return outcome; resuming pack opening.")
+            return True
+        raise WikiGachaAutomationError(
+            "Ad recovery resolved a result-page return target, but clicking it did not change DOM or rendered state, "
+            "and no actionable pack target appeared afterward. Inspect return outcome evidence."
+        )
+
+    resetAdaptiveAdInterruptionRecoveryState("adRecoveryReturnedFromResultPage")
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_returned_to_pack_page",
+        returnPayload,
+    )
+    print("[INFO] Ad recovery reached a result page; returned to the pack page before resuming pack opening.")
+    return True
+
+
 def recoverFromInsufficientPackIfPresent(
     page: Page,
     evidencePath: Path,
@@ -4672,13 +4810,23 @@ def recoverFromInsufficientPackIfPresent(
     )
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_ad_recovery_outcome_detected", adRecoveryOutcome)
 
+    if clickReturnToPackPageOutcomeIfPresent(
+        page,
+        evidencePath,
+        arguments,
+        drawIndex,
+        adRecoveryOutcome,
+        "ad_recovery_outcome",
+    ):
+        return True
+
     if adRecoveryOutcome.get("outcomeType") in {
         "remainingPackCountBecamePositive",
         "packTargetBecameAvailable",
         "insufficientPackRecoveryStillAvailable",
     }:
         resetAdaptiveAdInterruptionRecoveryState("adRecoveryReturnedControlToPackPage")
-        print("[INFO] Ad recovery returned control to the pack page; resuming pack opening.")
+        print("[INFO] Ad recovery returned actionable control to the pack page; resuming pack opening.")
         return True
 
     if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
@@ -4781,13 +4929,23 @@ def recoverFromExpectedAdRecoveryOutcome(
         adRecoveryOutcome,
     )
 
+    if clickReturnToPackPageOutcomeIfPresent(
+        page,
+        evidencePath,
+        arguments,
+        drawIndex,
+        adRecoveryOutcome,
+        "expected_deferred_ad_recovery_outcome",
+    ):
+        return True
+
     if adRecoveryOutcome.get("outcomeType") in {
         "remainingPackCountBecamePositive",
         "packTargetBecameAvailable",
         "insufficientPackRecoveryStillAvailable",
     }:
         resetAdaptiveAdInterruptionRecoveryState("deferredAdRecoveryReturnedControlToPackPage")
-        print("[INFO] Deferred ad recovery returned control to the pack page; resuming pack opening.")
+        print("[INFO] Deferred ad recovery returned actionable control to the pack page; resuming pack opening.")
         return True
 
     if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
