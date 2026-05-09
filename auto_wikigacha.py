@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from playwright.sync_api import (
     BrowserContext,
@@ -37,12 +39,31 @@ class BrowserLifecycleRestartRequired(WikiGachaAutomationError):
 
 
 saveRoutineEvidence = False
+saveScreenshotEvidence = False
+evidencePrivacyMode = "redacted"
+showSensitiveConsolePaths = False
+evidenceHashSalt = os.urandom(32)
 evidenceEventTrail: list[dict[str, Any]] = []
 
 
 def setRoutineEvidenceEnabled(enabled: bool) -> None:
     global saveRoutineEvidence
     saveRoutineEvidence = enabled
+
+
+def setScreenshotEvidenceEnabled(enabled: bool) -> None:
+    global saveScreenshotEvidence
+    saveScreenshotEvidence = enabled
+
+
+def setEvidencePrivacyMode(privacyMode: str) -> None:
+    global evidencePrivacyMode
+    evidencePrivacyMode = privacyMode
+
+
+def setSensitiveConsolePathsEnabled(enabled: bool) -> None:
+    global showSensitiveConsolePaths
+    showSensitiveConsolePaths = enabled
 
 
 def resetEvidenceEventTrail() -> None:
@@ -75,14 +96,49 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument(
         "--evidenceDir",
         default="wikigacha_results",
-        help="Directory for screenshots and non-secret state reports.",
+        help="Directory for privacy-redacted evidence reports and optional screenshots.",
     )
     parser.add_argument(
         "--saveRoutineEvidence",
         action="store_true",
         help=(
-            "Persist routine screenshots and non-secret reports during normal operation. "
+            "Persist routine privacy-redacted evidence reports during normal operation. "
+            "Screenshots remain disabled unless --saveScreenshotEvidence is also enabled. "
             "By default, evidence files are written only when an error occurs."
+        ),
+    )
+    parser.add_argument(
+        "--evidencePrivacyMode",
+        choices=("minimal", "redacted", "full"),
+        default="redacted",
+        help=(
+            "Privacy policy for evidence JSON. The default redacts URLs, paths, DOM text, "
+            "localStorage key names, user-agent strings, and frame URLs before writing evidence. "
+            "Use full only for private local debugging; minimal keeps only compact hashes and counts."
+        ),
+    )
+    parser.add_argument(
+        "--saveScreenshotEvidence",
+        action="store_true",
+        help=(
+            "Persist page screenshots in the evidence directory. Screenshots can expose account state, "
+            "ad content, draw results, and visible page text, so they are disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--showSensitiveConsolePaths",
+        action="store_true",
+        help=(
+            "Print full filesystem paths in console logs. By default, paths are shown as privacy-preserving "
+            "hash summaries to avoid leaking local usernames and directory structure."
+        ),
+    )
+    parser.add_argument(
+        "--showFullTraceback",
+        action="store_true",
+        help=(
+            "Print full Python tracebacks on fatal errors. By default, fatal errors are summarized without "
+            "filesystem paths; detailed diagnostics remain available in redacted evidence JSON."
         ),
     )
     parser.add_argument(
@@ -294,7 +350,10 @@ def createEvidenceDirectory(evidenceDir: str, shouldCreateImmediately: bool = Fa
     return evidencePath
 
 def buildShortHash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    hashBuilder = hashlib.sha256()
+    hashBuilder.update(evidenceHashSalt)
+    hashBuilder.update(value.encode("utf-8", errors="ignore"))
+    return hashBuilder.hexdigest()[:16]
 
 
 navigationInterruptedEvaluationPatterns = (
@@ -406,17 +465,18 @@ def getPageFingerprint(page: Page) -> str:
     return evaluatePageWithNavigationRecovery(page,
         r"""
         () => {
-            const storageEntries = {};
+            let localStorageValueLengthTotal = 0;
             for (let index = 0; index < localStorage.length; index += 1) {
-                const key = localStorage.key(index);
-                storageEntries[key] = localStorage.getItem(key);
+                const value = localStorage.getItem(localStorage.key(index)) || '';
+                localStorageValueLengthTotal += value.length;
             }
             return JSON.stringify({
                 href: location.href,
-                title: document.title,
-                visibleText: document.body ? document.body.innerText : "",
-                bodyMarkup: document.body ? document.body.innerHTML : "",
-                storageEntries,
+                titleLength: document.title ? document.title.length : 0,
+                visibleTextLength: document.body && document.body.innerText ? document.body.innerText.length : 0,
+                bodyMarkupLength: document.body && document.body.innerHTML ? document.body.innerHTML.length : 0,
+                localStorageEntryCount: localStorage.length,
+                localStorageValueLengthTotal,
             });
         }
         """
@@ -442,13 +502,15 @@ def getRenderedStateFingerprint(page: Page) -> str:
             const summarizeElement = (element) => {
                 const style = window.getComputedStyle(element);
                 const rect = element.getBoundingClientRect();
+                const renderedText = normalizeWhitespace(element.innerText || element.textContent || '');
+                const classText = typeof element.className === 'string' ? element.className : '';
                 return {
                     tagName: element.tagName.toLowerCase(),
-                    id: element.id || '',
-                    className: typeof element.className === 'string' ? element.className : '',
+                    idLength: element.id ? element.id.length : 0,
+                    classNameLength: classText.length,
                     role: element.getAttribute('role') || '',
                     ariaHidden: element.getAttribute('aria-hidden') || '',
-                    text: normalizeWhitespace(element.innerText || element.textContent || ''),
+                    textLength: renderedText.length,
                     rect: {
                         left: rect.left,
                         top: rect.top,
@@ -468,7 +530,7 @@ def getRenderedStateFingerprint(page: Page) -> str:
 
             return JSON.stringify({
                 href: location.href,
-                title: document.title,
+                titleLength: document.title ? document.title.length : 0,
                 scrollX: window.scrollX,
                 scrollY: window.scrollY,
                 viewportWidth: window.innerWidth,
@@ -1304,30 +1366,255 @@ def writeJson(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+privacyRedactionTextKeyFragments = (
+    "text",
+    "sample",
+    "markup",
+    "html",
+    "classname",
+    "selector",
+    "xpath",
+    "message",
+    "reason",
+    "diagnostic",
+)
+privacyRedactionUrlKeyNames = {"url", "href", "frameurl", "targeturl"}
+privacyRedactionPathKeyFragments = ("path", "dir", "executable")
+privacyRedactionStorageKeyNames = {"localstoragekeys", "localstoragevaluelengths", "storageentries"}
+privacyTokenLikePattern = re.compile(r"(?i)(bearer\s+[a-z0-9._~+/=-]+|[a-z0-9_-]{24,}\.[a-z0-9_-]{16,}\.[a-z0-9_-]{16,}|(?:token|secret|session|cookie|key)=([^\s&]+))")
+privacyUrlPattern = re.compile(r"https?://[^\s)\]}'\"]+")
+privacyWindowsPathPattern = re.compile(r"[A-Za-z]:\\[^\s)\]}'\"]+")
+privacyUnixPathPattern = re.compile(r"(?<!:)\/[A-Za-z0-9._~+\-/\u4e00-\u9fff]+")
+
+
+def buildPrivacyDigest(value: Any) -> str:
+    try:
+        serializedValue = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        serializedValue = str(value)
+    return buildShortHash(serializedValue)
+
+
+def buildRedactedScalarSummary(value: Any, valueKind: str) -> dict[str, Any]:
+    textValue = str(value)
+    return {
+        "redacted": True,
+        "kind": valueKind,
+        "hash": buildShortHash(textValue),
+        "length": len(textValue),
+    }
+
+
+def summarizeUrlForEvidence(value: Any) -> Any:
+    if evidencePrivacyMode == "full":
+        return value
+    textValue = str(value or "")
+    try:
+        parsedUrl = urlsplit(textValue)
+    except ValueError:
+        return buildRedactedScalarSummary(textValue, "url")
+    origin = f"{parsedUrl.scheme}://{parsedUrl.netloc}" if parsedUrl.scheme and parsedUrl.netloc else ""
+    summary: dict[str, Any] = {
+        "redacted": True,
+        "kind": "url",
+        "origin": origin,
+        "pathHash": buildShortHash(parsedUrl.path or ""),
+        "hasQuery": bool(parsedUrl.query),
+        "hasFragment": bool(parsedUrl.fragment),
+        "urlHash": buildShortHash(textValue),
+    }
+    if evidencePrivacyMode == "minimal":
+        summary.pop("origin", None)
+    return summary
+
+
+def summarizePathForEvidence(value: Any) -> Any:
+    if evidencePrivacyMode == "full":
+        return str(value)
+    textValue = str(value or "")
+    pathParts = re.split(r"[\\/]", textValue)
+    basenameText = next((part for part in reversed(pathParts) if part), textValue)
+    suffixText = Path(basenameText).suffix
+    isAbsolutePath = bool(re.match(r"^[A-Za-z]:[\\/]", textValue)) or Path(textValue).is_absolute()
+    return {
+        "redacted": True,
+        "kind": "path",
+        "pathHash": buildShortHash(textValue),
+        "basenameHash": buildShortHash(basenameText),
+        "suffix": suffixText,
+        "isAbsolute": isAbsolutePath,
+    }
+
+
+def summarizeTextForEvidence(value: Any, valueKind: str = "text") -> Any:
+    if evidencePrivacyMode == "full":
+        return value
+    return buildRedactedScalarSummary(value, valueKind)
+
+
+def redactSensitiveSubstrings(value: str) -> str:
+    if evidencePrivacyMode == "full":
+        return value
+
+    def replaceUrl(match: re.Match[str]) -> str:
+        return f"[redacted-url:{buildShortHash(match.group(0))}]"
+
+    def replaceWindowsPath(match: re.Match[str]) -> str:
+        return f"[redacted-path:{buildShortHash(match.group(0))}]"
+
+    def replaceUnixPath(match: re.Match[str]) -> str:
+        matchedText = match.group(0)
+        if matchedText in {"/", "//"}:
+            return matchedText
+        return f"[redacted-path:{buildShortHash(matchedText)}]"
+
+    redactedValue = privacyUrlPattern.sub(replaceUrl, value)
+    redactedValue = privacyWindowsPathPattern.sub(replaceWindowsPath, redactedValue)
+    redactedValue = privacyUnixPathPattern.sub(replaceUnixPath, redactedValue)
+    redactedValue = privacyTokenLikePattern.sub(lambda match: f"[redacted-token:{buildShortHash(match.group(0))}]", redactedValue)
+    return redactedValue
+
+
+def isEvidenceUrlKey(keyName: str) -> bool:
+    normalizedKey = keyName.lower()
+    return normalizedKey in privacyRedactionUrlKeyNames or normalizedKey.endswith("url")
+
+
+def isEvidencePathKey(keyName: str) -> bool:
+    normalizedKey = keyName.lower()
+    return any(fragment in normalizedKey for fragment in privacyRedactionPathKeyFragments)
+
+
+def isEvidenceStorageKey(keyName: str) -> bool:
+    return keyName.lower() in privacyRedactionStorageKeyNames
+
+
+def isEvidenceTextKey(keyName: str) -> bool:
+    normalizedKey = keyName.lower()
+    if normalizedKey in {"label", "errortype", "errormessage", "message", "drawrunmode", "outcometype", "targetscope", "source", "tagname", "role"}:
+        return False
+    if normalizedKey == "extrapayloadkeys":
+        return False
+    return any(fragment in normalizedKey for fragment in privacyRedactionTextKeyFragments)
+
+
+def sanitizeEvidencePayload(value: Any, keyName: str = "") -> Any:
+    if evidencePrivacyMode == "full":
+        return value
+    if isinstance(value, dict):
+        return {str(itemKey): sanitizeEvidencePayload(itemValue, str(itemKey)) for itemKey, itemValue in value.items()}
+    if isinstance(value, list):
+        if isEvidenceStorageKey(keyName):
+            return [buildRedactedScalarSummary(itemValue, "storageMetadata") for itemValue in value]
+        return [sanitizeEvidencePayload(itemValue, keyName) for itemValue in value]
+    if isinstance(value, tuple):
+        return [sanitizeEvidencePayload(itemValue, keyName) for itemValue in value]
+    if isinstance(value, str):
+        if isEvidenceUrlKey(keyName):
+            return summarizeUrlForEvidence(value)
+        if isEvidencePathKey(keyName):
+            return summarizePathForEvidence(value)
+        if isEvidenceStorageKey(keyName):
+            return buildRedactedScalarSummary(value, "storageMetadata")
+        if isEvidenceTextKey(keyName):
+            return summarizeTextForEvidence(value)
+        return redactSensitiveSubstrings(value)
+    return value
+
+
+def sanitizePayloadForPersistence(payload: dict[str, Any]) -> dict[str, Any]:
+    if evidencePrivacyMode == "full":
+        return payload
+    return sanitizeEvidencePayload(payload)
+
+
+def formatPathForConsole(pathValue: Any) -> str:
+    if showSensitiveConsolePaths or evidencePrivacyMode == "full":
+        return str(pathValue)
+    pathText = str(pathValue)
+    pathParts = re.split(r"[\\/]", pathText)
+    pathName = next((part for part in reversed(pathParts) if part), pathText)
+    return f"<redacted-path basenameHash={buildShortHash(pathName)} pathHash={buildShortHash(pathText)}>"
+
+
+def sanitizeConsoleMessage(message: Any) -> str:
+    return redactSensitiveSubstrings(str(message))
+
+
+def shouldShowFullTracebackFromArgv() -> bool:
+    return "--showFullTraceback" in sys.argv
+
+
 def collectNonSecretStorageSummary(page: Page) -> dict[str, Any]:
-    return evaluatePageWithNavigationRecovery(page,
+    rawStorageSummary = evaluatePageWithNavigationRecovery(
+        page,
         r"""
-        () => {
-            const localStorageKeys = [];
-            const localStorageValueLengths = {};
+        ({ allowFullEvidence }) => {
+            const buildDigest = (value) => {
+                const text = String(value || '');
+                let hashValue = 2166136261;
+                for (let index = 0; index < text.length; index += 1) {
+                    hashValue ^= text.charCodeAt(index);
+                    hashValue = Math.imul(hashValue, 16777619);
+                }
+                return (hashValue >>> 0).toString(16).padStart(8, '0');
+            };
+            const localStorageEntries = [];
             for (let index = 0; index < localStorage.length; index += 1) {
-                const key = localStorage.key(index);
+                const key = localStorage.key(index) || '';
                 const value = localStorage.getItem(key) || '';
-                localStorageKeys.push(key);
-                localStorageValueLengths[key] = value.length;
+                localStorageEntries.push(allowFullEvidence
+                    ? { key, valueLength: value.length }
+                    : { keyHash: buildDigest(key), valueLength: value.length });
             }
             return {
                 href: location.href,
                 title: document.title,
-                localStorageKeys,
-                localStorageValueLengths,
+                localStorageEntries,
                 userAgent: navigator.userAgent,
                 language: navigator.language,
                 languages: navigator.languages,
             };
         }
-        """
+        """,
+        {"allowFullEvidence": evidencePrivacyMode == "full"},
     )
+    if evidencePrivacyMode == "full":
+        return rawStorageSummary
+
+    localStorageEntries = rawStorageSummary.get("localStorageEntries", [])
+    valueLengths = [
+        entry.get("valueLength", 0)
+        for entry in localStorageEntries
+        if isinstance(entry, dict) and isinstance(entry.get("valueLength"), int)
+    ]
+    keyFingerprints = [
+        str(entry.get("keyHash", ""))
+        for entry in localStorageEntries
+        if isinstance(entry, dict)
+    ]
+    if evidencePrivacyMode == "minimal":
+        return {
+            "href": summarizeUrlForEvidence(rawStorageSummary.get("href", "")),
+            "titleHash": buildShortHash(str(rawStorageSummary.get("title", ""))),
+            "localStorageEntryCount": len(localStorageEntries),
+            "localStorageKeySetHash": buildPrivacyDigest(sorted(keyFingerprints)),
+            "userAgentHash": buildShortHash(str(rawStorageSummary.get("userAgent", ""))),
+            "language": rawStorageSummary.get("language", ""),
+        }
+    return {
+        "href": summarizeUrlForEvidence(rawStorageSummary.get("href", "")),
+        "titleHash": buildShortHash(str(rawStorageSummary.get("title", ""))),
+        "titleLength": len(str(rawStorageSummary.get("title", ""))),
+        "localStorageEntryCount": len(localStorageEntries),
+        "localStorageKeyFingerprints": keyFingerprints,
+        "localStorageTotalValueLength": sum(valueLengths),
+        "localStorageMaxValueLength": max(valueLengths) if valueLengths else 0,
+        "userAgentHash": buildShortHash(str(rawStorageSummary.get("userAgent", ""))),
+        "language": rawStorageSummary.get("language", ""),
+        "languagesHash": buildPrivacyDigest(rawStorageSummary.get("languages", [])),
+        "languageCount": len(rawStorageSummary.get("languages", []) or []),
+    }
 
 
 def buildEvidencePayload(page: Page, label: str, extraPayload: dict[str, Any]) -> dict[str, Any]:
@@ -1335,9 +1622,9 @@ def buildEvidencePayload(page: Page, label: str, extraPayload: dict[str, Any]) -
     return {
         "createdAtUtc": timestampText,
         "label": label,
-        "url": page.url,
+        "url": summarizeUrlForEvidence(page.url),
         "storageSummary": collectNonSecretStorageSummary(page),
-        "extra": extraPayload,
+        "extra": sanitizeEvidencePayload(extraPayload),
     }
 
 
@@ -1346,47 +1633,58 @@ def persistEvidencePayload(
     evidencePath: Path,
     payload: dict[str, Any],
     screenshotLabel: str | None = None,
-) -> tuple[Path, Path]:
+) -> tuple[Path | None, Path]:
     evidencePath.mkdir(parents=True, exist_ok=True)
-    timestampText = payload.get("createdAtUtc") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    label = screenshotLabel or str(payload.get("label") or "evidence")
+    sanitizedPayload = sanitizePayloadForPersistence(payload)
+    timestampText = sanitizedPayload.get("createdAtUtc") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    label = screenshotLabel or str(sanitizedPayload.get("label") or "evidence")
     screenshotPath = evidencePath / f"{timestampText}_{label}.png"
     reportPath = evidencePath / f"{timestampText}_{label}.json"
-    page.screenshot(path=str(screenshotPath), full_page=True)
-    writeJson(reportPath, payload)
-    print(f"[INFO] Saved screenshot: {screenshotPath}")
-    print(f"[INFO] Saved non-secret report: {reportPath}")
-    return screenshotPath, reportPath
+    persistedScreenshotPath: Path | None = None
+    if saveScreenshotEvidence:
+        page.screenshot(path=str(screenshotPath), full_page=True)
+        persistedScreenshotPath = screenshotPath
+        print(f"[INFO] Saved screenshot: {formatPathForConsole(screenshotPath)}")
+    else:
+        sanitizedPayload.setdefault("privacy", {})["screenshotPersisted"] = False
+        sanitizedPayload["privacy"]["screenshotPolicy"] = "disabledByDefaultUseSaveScreenshotEvidenceToPersist"
+    sanitizedPayload.setdefault("privacy", {})["hashSaltScope"] = "process-local"
+    sanitizedPayload["privacy"]["evidencePrivacyMode"] = evidencePrivacyMode
+    writeJson(reportPath, sanitizedPayload)
+    print(f"[INFO] Saved privacy-redacted report: {formatPathForConsole(reportPath)}")
+    return persistedScreenshotPath, reportPath
 
 
 def summarizeEvidenceEvent(payload: dict[str, Any]) -> dict[str, Any]:
-    extraPayload = payload.get("extra", {})
+    sanitizedPayload = sanitizePayloadForPersistence(payload)
+    extraPayload = sanitizedPayload.get("extra", {})
     serializedExtraPayload = json.dumps(extraPayload, ensure_ascii=False, sort_keys=True, default=str)
     return {
-        "createdAtUtc": payload.get("createdAtUtc"),
-        "label": payload.get("label"),
-        "url": payload.get("url"),
+        "createdAtUtc": sanitizedPayload.get("createdAtUtc"),
+        "label": sanitizedPayload.get("label"),
+        "url": sanitizedPayload.get("url"),
         "extraPayloadHash": buildShortHash(serializedExtraPayload),
         "extraPayloadKeys": sorted(extraPayload.keys()) if isinstance(extraPayload, dict) else [],
     }
 
 
 def saveEvidence(page: Page, evidencePath: Path, label: str, extraPayload: dict[str, Any]) -> None:
+    sanitizedExtraPayload = sanitizeEvidencePayload(extraPayload)
     if not saveRoutineEvidence:
         timestampText = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        serializedExtraPayload = json.dumps(extraPayload, ensure_ascii=False, sort_keys=True, default=str)
+        serializedExtraPayload = json.dumps(sanitizedExtraPayload, ensure_ascii=False, sort_keys=True, default=str)
         evidenceEventTrail.append(
             {
                 "createdAtUtc": timestampText,
                 "label": label,
-                "url": page.url,
+                "url": summarizeUrlForEvidence(page.url),
                 "extraPayloadHash": buildShortHash(serializedExtraPayload),
-                "extraPayloadKeys": sorted(extraPayload.keys()) if isinstance(extraPayload, dict) else [],
+                "extraPayloadKeys": sorted(sanitizedExtraPayload.keys()) if isinstance(sanitizedExtraPayload, dict) else [],
             }
         )
         return
 
-    payload = buildEvidencePayload(page, label, extraPayload)
+    payload = buildEvidencePayload(page, label, sanitizedExtraPayload)
     evidenceEventTrail.append(summarizeEvidenceEvent(payload))
     persistEvidencePayload(page, evidencePath, payload)
 
@@ -1402,16 +1700,17 @@ def saveErrorEvidence(
         "error",
         {
             "errorType": type(error).__name__,
-            "errorMessage": str(error),
+            "errorMessage": sanitizeConsoleMessage(error),
             "drawRunMode": getDrawRunMode(arguments),
             "url": arguments.url,
             "profileDir": arguments.profileDir,
             "routineEvidencePersisted": saveRoutineEvidence,
+            "screenshotEvidencePersisted": saveScreenshotEvidence,
+            "evidencePrivacyMode": evidencePrivacyMode,
             "evidenceEventTrail": evidenceEventTrail,
         },
     )
     persistEvidencePayload(page, evidencePath, errorPayload)
-
 
 adaptiveAdInterruptionRecoveryState: dict[str, Any] = {}
 
@@ -4903,8 +5202,8 @@ def launchExternalChromeForManualControl(
 ) -> subprocess.Popen[Any]:
     chromeExecutablePath = resolveExternalChromeExecutable(arguments)
     command = buildExternalChromeCommand(chromeExecutablePath, profilePath, targetUrl)
-    print(f"[INFO] {modeLabel} 使用一般瀏覽器，不經由 Playwright 控制：{chromeExecutablePath}")
-    print(f"[INFO] 使用同一個持久化 profile：{profilePath.resolve()}")
+    print(f"[INFO] {modeLabel} 使用一般瀏覽器，不經由 Playwright 控制：{formatPathForConsole(chromeExecutablePath)}")
+    print(f"[INFO] 使用同一個持久化 profile：{formatPathForConsole(profilePath.resolve())}")
     print("[INFO] 這個模式不會出現『Chrome 目前受到自動測試軟體控制』，適合手動 Google 登入與伺服器同步。")
     return subprocess.Popen(command)
 
@@ -5192,7 +5491,7 @@ def launchPersistentContext(playwright: Any, arguments: argparse.Namespace, prof
             return context
         except PlaywrightError as error:
             print(
-                f"[WARN] 無法使用 browser channel '{preferredChannel}'，改用 Playwright Chromium。原因：{error}",
+                f"[WARN] 無法使用 browser channel '{preferredChannel}'，改用 Playwright Chromium。原因：{sanitizeConsoleMessage(error)}",
                 file=sys.stderr,
             )
 
@@ -5237,7 +5536,7 @@ def closePageQuietly(page: Page | None) -> None:
     except PlaywrightError as error:
         if not isBrowserLifecycleClosedError(error):
             print(
-                f"[WARN] Browser page close raised {type(error).__name__}: {error}",
+                f"[WARN] Browser page close raised {type(error).__name__}: {sanitizeConsoleMessage(error)}",
                 file=sys.stderr,
             )
 
@@ -5250,7 +5549,7 @@ def closeContextQuietly(context: BrowserContext | None) -> None:
     except PlaywrightError as error:
         if not isBrowserLifecycleClosedError(error):
             print(
-                f"[WARN] Browser context close raised {type(error).__name__}: {error}",
+                f"[WARN] Browser context close raised {type(error).__name__}: {sanitizeConsoleMessage(error)}",
                 file=sys.stderr,
             )
 
@@ -5268,7 +5567,7 @@ def saveErrorEvidenceIfPossible(
     except Exception as evidenceError:
         print(
             "[WARN] Failed to persist error evidence: "
-            f"{type(evidenceError).__name__}: {evidenceError}",
+            f"{type(evidenceError).__name__}: {sanitizeConsoleMessage(evidenceError)}",
             file=sys.stderr,
         )
 
@@ -5398,9 +5697,12 @@ def main() -> int:
     arguments.executionMode = executionMode
     print(f"[INFO] Execution mode: {executionMode}")
     setRoutineEvidenceEnabled(arguments.saveRoutineEvidence)
+    setScreenshotEvidenceEnabled(arguments.saveScreenshotEvidence)
+    setEvidencePrivacyMode(arguments.evidencePrivacyMode)
+    setSensitiveConsolePathsEnabled(arguments.showSensitiveConsolePaths)
     evidencePath = createEvidenceDirectory(
         arguments.evidenceDir,
-        shouldCreateImmediately=arguments.saveRoutineEvidence,
+        shouldCreateImmediately=arguments.saveRoutineEvidence or arguments.saveScreenshotEvidence,
     )
     profilePath = Path(arguments.profileDir)
     profilePath.mkdir(parents=True, exist_ok=True)
@@ -5422,3 +5724,13 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user.", file=sys.stderr)
         raise SystemExit(130)
+    except Exception as error:
+        if shouldShowFullTracebackFromArgv():
+            raise
+        print(
+            "[ERROR] Fatal automation error; traceback suppressed by privacy policy. "
+            f"Use --showFullTraceback only for private local debugging. "
+            f"{type(error).__name__}: {sanitizeConsoleMessage(error)}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
