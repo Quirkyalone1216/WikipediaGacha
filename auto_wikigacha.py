@@ -4766,6 +4766,141 @@ def clickReturnToPackPageOutcomeIfPresent(
     return True
 
 
+def isInsufficientPackRecoveryClickTransition(clickPayload: dict[str, Any]) -> bool:
+    if clickPayload.get("clickCompleted"):
+        return False
+
+    clickAbortedReason = str(clickPayload.get("clickAbortedReason") or "")
+    refreshResolutionFailure = clickPayload.get("refreshResolutionFailure")
+    refreshReason = ""
+    if isinstance(refreshResolutionFailure, dict):
+        refreshReason = str(refreshResolutionFailure.get("reason") or "")
+
+    transitionReasonText = f"{clickAbortedReason} {refreshReason}".lower()
+    transitionReasonMarkers = (
+        "refreshresolutionreturnednofreshtarget",
+        "freshdomclickfailedwithoutrefreshpath",
+        "selector",
+        "insufficient-pack",
+        "no visible insufficient-pack heading",
+        "no recovery action button",
+        "stale",
+        "detached",
+        "notrendered",
+    )
+    return any(marker in transitionReasonText for marker in transitionReasonMarkers)
+
+
+def recoverFromInsufficientPackRecoveryTransition(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    recoveryResolution: dict[str, Any],
+    recoveryClickPayload: dict[str, Any],
+) -> bool:
+    recoveryTransitionAssessment = {
+        "reason": (
+            "The insufficient-pack recovery target disappeared or was replaced before a stable click could be "
+            "completed. This is treated as a page-state transition, not as a terminal automation failure."
+        ),
+        "recoveryResolution": recoveryResolution,
+        "recoveryClickPayload": recoveryClickPayload,
+        "remainingPackResolution": resolveRemainingPackCount(
+            page,
+            arguments.remainingPackCountXPath,
+            arguments.insufficientPackHeadingXPath,
+        ),
+        "adInterruptionResolution": resolveAdInterruptionCloseTarget(page, arguments.adOverlayCloseButtonXPath),
+        "adRewardConfirmationResolution": resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath),
+        "returnResolution": resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+        "drawTargetResolution": resolveDrawTargetSelector(page, arguments.returnToPackPageXPath),
+        "pendingInsufficientPackRecoveryState": resolveInsufficientPackPendingRecoveryState(
+            page,
+            arguments.insufficientPackHeadingXPath,
+            arguments.recoverPackButtonXPath,
+        ),
+    }
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_insufficient_pack_recovery_transition_after_stale_target",
+        recoveryTransitionAssessment,
+    )
+
+    adInterruptionResolution = recoveryTransitionAssessment["adInterruptionResolution"]
+    if isinstance(adInterruptionResolution, dict) and adInterruptionResolution.get("ok"):
+        return recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex)
+
+    if clickAdRewardConfirmationIfPresent(
+        page,
+        evidencePath,
+        arguments,
+        drawIndex,
+        "insufficient_pack_recovery_transition",
+    ):
+        return True
+
+    returnResolution = recoveryTransitionAssessment["returnResolution"]
+    if isinstance(returnResolution, dict) and returnResolution.get("ok"):
+        if arguments.dryRun:
+            print("[DRY-RUN] Insufficient-pack transition exposed a return-to-pack target; return click skipped.")
+            return True
+        returnClickPayload = {
+            "recoveryTransitionAssessment": recoveryTransitionAssessment,
+            "returnResolution": returnResolution,
+            **clickResolvedSelectorAndWait(
+                page,
+                returnResolution["selector"],
+                lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+                returnOnRefreshResolutionFailure=True,
+            ),
+        }
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_insufficient_pack_recovery_transition_returned_to_pack_page",
+            returnClickPayload,
+        )
+        resetAdaptiveAdInterruptionRecoveryState("insufficientPackTransitionReturnedToPackPage")
+        return True
+
+    pendingRecoveryState = recoveryTransitionAssessment["pendingInsufficientPackRecoveryState"]
+    if isinstance(pendingRecoveryState, dict) and pendingRecoveryState.get("ok"):
+        return waitForPendingInsufficientPackRecoveryOutcome(
+            page,
+            evidencePath,
+            arguments,
+            drawIndex,
+            pendingRecoveryState,
+        )
+
+    drawTargetResolution = recoveryTransitionAssessment["drawTargetResolution"]
+    if isinstance(drawTargetResolution, dict) and drawTargetResolution.get("ok"):
+        resetAdaptiveAdInterruptionRecoveryState("insufficientPackTransitionExposedPackTarget")
+        print("[INFO] Insufficient-pack recovery target transitioned into an actionable pack target; resuming pack opening.")
+        return True
+
+    remainingPackResolution = recoveryTransitionAssessment["remainingPackResolution"]
+    remainingPackCount = getRemainingPackCountValue(remainingPackResolution) if isinstance(remainingPackResolution, dict) else None
+    if isinstance(remainingPackCount, int) and remainingPackCount > 0 and not isResultPageTargetSuppression(drawTargetResolution):
+        resetAdaptiveAdInterruptionRecoveryState("insufficientPackTransitionLeftPackCountPositive")
+        print("[INFO] Insufficient-pack recovery target disappeared after the pack counter became positive; resuming adaptive recovery.")
+        return True
+
+    return recoverFromExpectedAdRecoveryOutcome(
+        page,
+        evidencePath,
+        arguments,
+        drawIndex,
+        reason=(
+            "The insufficient-pack recovery target disappeared during semantic refresh before it could be clicked. "
+            "The automation must wait until the page exposes a new recovery target, ad-close target, reward confirmation, "
+            "return-to-pack target, or pack-ready state."
+        ),
+    )
+
+
 def recoverFromInsufficientPackIfPresent(
     page: Page,
     evidencePath: Path,
@@ -4795,9 +4930,27 @@ def recoverFromInsufficientPackIfPresent(
                 arguments.insufficientPackHeadingXPath,
                 arguments.recoverPackButtonXPath,
             ),
+            returnOnRefreshResolutionFailure=True,
         ),
     }
     saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_insufficient_pack_recovery_clicked", recoveryClickPayload)
+
+    if not recoveryClickPayload.get("clickCompleted"):
+        if isInsufficientPackRecoveryClickTransition(recoveryClickPayload):
+            return recoverFromInsufficientPackRecoveryTransition(
+                page,
+                evidencePath,
+                arguments,
+                drawIndex,
+                recoveryResolution,
+                recoveryClickPayload,
+            )
+        raise WikiGachaAutomationError(
+            recoveryClickPayload.get(
+                "clickAbortedReason",
+                "Insufficient-pack recovery target could not be clicked and did not expose a recoverable transition.",
+            )
+        )
 
     adRecoveryOutcome = waitForAdRecoveryOutcomeTarget(
         page,
