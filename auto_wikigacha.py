@@ -297,8 +297,113 @@ def buildShortHash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
+navigationInterruptedEvaluationPatterns = (
+    "Execution context was destroyed",
+    "Cannot find context with specified id",
+    "Inspected target navigated or closed",
+    "Most likely because of a navigation",
+    "most likely because of a navigation",
+    "Frame was detached",
+    "frame was detached",
+    "Navigating frame was detached",
+)
+
+
+def isNavigationInterruptedEvaluationError(error: BaseException) -> bool:
+    errorMessage = str(error)
+    return any(pattern in errorMessage for pattern in navigationInterruptedEvaluationPatterns)
+
+
+def waitForEvaluationContextRecovery(page: Page, recoveryReason: str) -> dict[str, Any]:
+    recoveryStartedAtMonotonicSeconds = time.monotonic()
+    recoveryAttemptCount = 0
+    observedRecoveryErrors: list[dict[str, str]] = []
+
+    while True:
+        if page.is_closed():
+            raise PlaywrightError("Page was closed while waiting for a navigated execution context to recover.")
+        recoveryAttemptCount += 1
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=0)
+            page.wait_for_function(
+                r"""
+                () => document.body
+                    && (document.readyState === "complete" || document.readyState === "interactive")
+                """,
+                timeout=0,
+            )
+            return {
+                "ok": True,
+                "recoveryReason": recoveryReason,
+                "recoveryAttemptCount": recoveryAttemptCount,
+                "elapsedRecoverySeconds": time.monotonic() - recoveryStartedAtMonotonicSeconds,
+                "observedRecoveryErrors": observedRecoveryErrors,
+            }
+        except PlaywrightError as recoveryError:
+            if isBrowserLifecycleClosedError(recoveryError):
+                raise
+            if not isNavigationInterruptedEvaluationError(recoveryError):
+                raise
+            observedRecoveryErrors.append(
+                {
+                    "errorType": type(recoveryError).__name__,
+                    "errorMessage": str(recoveryError),
+                }
+            )
+
+
+def evaluatePageWithNavigationRecovery(
+    page: Page,
+    expression: str,
+    arg: Any = None,
+    **evaluateOptions: Any,
+) -> Any:
+    navigationRecoveryEvents: list[dict[str, Any]] = []
+    while True:
+        try:
+            return page.evaluate(expression, arg=arg, **evaluateOptions)
+        except PlaywrightError as error:
+            if isBrowserLifecycleClosedError(error) or not isNavigationInterruptedEvaluationError(error):
+                raise
+            navigationRecoveryEvents.append(
+                waitForEvaluationContextRecovery(page, "pageEvaluateNavigationInterrupted")
+            )
+
+
+def evaluateFrameWithNavigationRecovery(
+    frame: Any,
+    expression: str,
+    arg: Any = None,
+    **evaluateOptions: Any,
+) -> Any:
+    while True:
+        try:
+            return frame.evaluate(expression, arg=arg, **evaluateOptions)
+        except PlaywrightError as error:
+            if isBrowserLifecycleClosedError(error) or not isNavigationInterruptedEvaluationError(error):
+                raise
+            if getattr(frame, "is_detached", lambda: False)():
+                raise
+            try:
+                frame.wait_for_load_state("domcontentloaded", timeout=0)
+            except PlaywrightError as recoveryError:
+                if isBrowserLifecycleClosedError(recoveryError) or not isNavigationInterruptedEvaluationError(recoveryError):
+                    raise
+
+
+def waitForRenderCycleAfterNavigationInterruption(page: Page, recoveryReason: str) -> dict[str, Any]:
+    recoveryObservation = waitForEvaluationContextRecovery(page, recoveryReason)
+    renderObservation = waitForRenderCycle(page)
+    return {
+        "ok": True,
+        "settledBy": "navigationRecovery+renderCycle",
+        "recoveryObservation": recoveryObservation,
+        "renderObservation": renderObservation,
+    }
+
+
 def getPageFingerprint(page: Page) -> str:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         () => {
             const storageEntries = {};
@@ -319,7 +424,7 @@ def getPageFingerprint(page: Page) -> str:
 
 
 def getRenderedStateFingerprint(page: Page) -> str:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         () => {
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -400,7 +505,7 @@ def waitForPageReady(page: Page) -> None:
 
 
 def waitForRenderCycle(page: Page) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         () => new Promise((resolve) => {
             let mutationCount = 0;
@@ -464,7 +569,7 @@ def waitForRenderCycle(page: Page) -> dict[str, Any]:
     )
 
 def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         () => {
             const markerPrefix = `auto-wikigacha-entry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -594,6 +699,11 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 .filter(isVisible)
                 .filter((element) => !element.matches('input[type="checkbox"], [role="checkbox"]'));
 
+            const containsViewportCenter = (element) => {
+                const centerElement = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+                return Boolean(centerElement && (element === centerElement || element.contains(centerElement)));
+            };
+
             const isLayerElement = (element) => {
                 if (!(element instanceof HTMLElement)) {
                     return false;
@@ -614,6 +724,22 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                     || style.position === 'fixed'
                     || (coversViewport && style.zIndex !== 'auto')
                     || classIndicatesGateLayer;
+            };
+
+            const isBlockingGateLayer = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const role = element.getAttribute('role') || '';
+                const classText = getClassText(element);
+                const hasDialogSemantics = element.tagName.toLowerCase() === 'dialog'
+                    || role === 'dialog'
+                    || role === 'alertdialog'
+                    || element.getAttribute('aria-modal') === 'true'
+                    || /(^|\s)(modal|dialog|overlay|popover|inset-0)(\s|$)/iu.test(classText);
+                const hasTopLayerPosition = style.position === 'fixed' || style.position === 'sticky';
+                return hasDialogSemantics || (hasTopLayerPosition && containsViewportCenter(element));
             };
 
             const collectLayerChain = (element) => {
@@ -639,7 +765,7 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 let current = element;
                 let layerRoot = null;
                 while (current && current instanceof HTMLElement) {
-                    if (isLayerElement(current)) {
+                    if (isBlockingGateLayer(current)) {
                         layerRoot = current;
                     }
                     current = current.parentElement;
@@ -659,7 +785,7 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                         return getEvidenceCount(confirmationPatterns, actionText) > 0
                             || getEvidenceCount(confirmationTokenPatterns, actionText) > 0;
                     });
-                    if (rootEvidence > 0 && visibleActionCount > 0 && confirmationActionExists) {
+                    if (isBlockingGateLayer(current) && rootEvidence > 0 && visibleActionCount > 0 && confirmationActionExists) {
                         semanticRoot = current;
                     }
                     current = current.parentElement;
@@ -743,6 +869,7 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                         negativeEvidence,
                         negativeInteractiveEvidence,
                         hasGateLayer: Boolean(gateRoot),
+                        hasBlockingGateLayer: Boolean(gateRoot && isBlockingGateLayer(gateRoot)),
                         pointerReceivable: isPointerReceivable(element),
                         layerChain,
                         layerText: gateText.slice(0, 420),
@@ -755,6 +882,7 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
 
             const candidates = allCandidates
                 .filter((candidate) => candidate.hasGateLayer)
+                .filter((candidate) => candidate.hasBlockingGateLayer)
                 .filter((candidate) => candidate.pointerReceivable)
                 .filter((candidate) => candidate.confirmationEvidence > 0 || candidate.fallbackEvidence > 0)
                 .filter((candidate) => candidate.negativeInteractiveEvidence === 0)
@@ -788,6 +916,7 @@ def resolveEntryGateActionSelector(page: Page) -> dict[str, Any]:
                 negativeEvidence: candidate.negativeEvidence,
                 negativeInteractiveEvidence: candidate.negativeInteractiveEvidence,
                 hasGateLayer: candidate.hasGateLayer,
+                hasBlockingGateLayer: candidate.hasBlockingGateLayer,
                 pointerReceivable: candidate.pointerReceivable,
                 layerChain: candidate.layerChain,
                 layerText: candidate.layerText,
@@ -881,7 +1010,7 @@ def dismissEntryGates(page: Page, evidencePath: Path, rememberDismissal: bool) -
 
 
 def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         (returnButtonXPath) => {
             const markerPrefix = `auto-wikigacha-target-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -1176,7 +1305,7 @@ def writeJson(path: Path, payload: dict[str, Any]) -> None:
 
 
 def collectNonSecretStorageSummary(page: Page) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         () => {
             const localStorageKeys = [];
@@ -1397,7 +1526,7 @@ def resolveRemainingPackCount(
     remainingCountXPath: str,
     insufficientPackHeadingXPathValue: str = insufficientPackHeadingXPath,
 ) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         ({ remainingCountXPath, insufficientPackHeadingXPathValue }) => {
             const markerPrefix = `auto-wikigacha-count-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -1634,7 +1763,7 @@ def hasRemainingPacks(remainingPackResolution: dict[str, Any]) -> bool | None:
     return remainingPackCount > 0
 
 def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         (returnButtonXPath) => {
             const markerPrefix = `auto-wikigacha-return-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -1860,7 +1989,7 @@ def buildResolutionFingerprint(resolution: dict[str, Any]) -> str:
 
 
 def clickSelectorUsingFreshDomElement(page: Page, selector: str) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         (selector) => new Promise((resolve) => {
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -2082,7 +2211,7 @@ def resolveInsufficientPackRecoverySelector(
     insufficientPackHeadingXPathValue: str,
     recoverPackButtonXPathValue: str,
 ) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         ({ insufficientPackHeadingXPathValue, recoverPackButtonXPathValue }) => {
             const markerPrefix = `auto-wikigacha-insufficient-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -2107,6 +2236,15 @@ def resolveInsufficientPackRecoverySelector(
                 /watch.*ad.*(?:recover|restore|refill|reward)/iu,
                 /(?:recover|restore|refill|reward).*watch.*ad/iu,
                 /広告.*回復|回復.*広告/iu,
+            ];
+            const recoveryPendingPatterns = [
+                /廣告(?:加載|載入|讀取|準備)中/iu,
+                /广告(?:加载|载入|读取|准备)中/iu,
+                /ad\s*(?:is\s*)?(?:loading|initializing|preparing)/iu,
+                /(?:loading|initializing|preparing)\s*ad/iu,
+                /請稍候|请稍候|請等待|请等待/iu,
+                /下次恢復|下次恢复|後可恢復|后可恢复/iu,
+                /\d+\s*秒後|\d+\s*秒后|\d+\s*s(?:ec(?:ond)?s?)?\s*(?:left|remaining)/iu,
             ];
             const negativeActionPatterns = [
                 /圖鑑|图鉴|図鑑/iu,
@@ -2216,10 +2354,13 @@ def resolveInsufficientPackRecoverySelector(
 
             const selectedHeading = headingCandidates[0];
             const configuredButton = resolveXPathElement(recoverPackButtonXPathValue);
+            const configuredButtonText = configuredButton instanceof HTMLElement ? getElementText(configuredButton) : '';
             const configuredButtonIsValid = configuredButton instanceof HTMLElement
                 && isVisible(configuredButton)
                 && isPointerReceivable(configuredButton)
-                && getEvidenceCount(negativeActionPatterns, getElementText(configuredButton)) === 0;
+                && getEvidenceCount(recoveryActionPatterns, configuredButtonText) > 0
+                && getEvidenceCount(recoveryPendingPatterns, configuredButtonText) === 0
+                && getEvidenceCount(negativeActionPatterns, configuredButtonText) === 0;
             if (configuredButtonIsValid) {
                 const marker = `${markerPrefix}-configured-recovery-button`;
                 configuredButton.setAttribute('data-auto-wikigacha-insufficient', marker);
@@ -2242,6 +2383,7 @@ def resolveInsufficientPackRecoverySelector(
                         element,
                         marker: `${markerPrefix}-semantic-${index}`,
                         recoveryEvidence: getEvidenceCount(recoveryActionPatterns, text),
+                        recoveryPendingEvidence: getEvidenceCount(recoveryPendingPatterns, text),
                         negativeEvidence: getEvidenceCount(negativeActionPatterns, text),
                         area: rect.width * rect.height,
                         top: rect.top,
@@ -2249,6 +2391,7 @@ def resolveInsufficientPackRecoverySelector(
                     };
                 })
                 .filter((candidate) => candidate.recoveryEvidence > 0)
+                .filter((candidate) => candidate.recoveryPendingEvidence === 0)
                 .filter((candidate) => candidate.negativeEvidence === 0)
                 .sort((left, right) => {
                     const comparisons = [
@@ -2268,6 +2411,9 @@ def resolveInsufficientPackRecoverySelector(
                     recoverPackButtonXPath: recoverPackButtonXPathValue,
                     configuredButtonVisible: configuredButton instanceof HTMLElement ? isVisible(configuredButton) : false,
                     configuredButtonPointerReceivable: configuredButton instanceof HTMLElement ? isPointerReceivable(configuredButton) : false,
+                    configuredButtonText: configuredButtonText.slice(0, 260),
+                    configuredButtonRecoveryEvidence: getEvidenceCount(recoveryActionPatterns, configuredButtonText),
+                    configuredButtonPendingEvidence: getEvidenceCount(recoveryPendingPatterns, configuredButtonText),
                     headingText: getElementText(selectedHeading).slice(0, 260),
                     visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
                 };
@@ -2290,8 +2436,219 @@ def resolveInsufficientPackRecoverySelector(
     )
 
 
+def resolveInsufficientPackPendingRecoveryState(
+    page: Page,
+    insufficientPackHeadingXPathValue: str,
+    recoverPackButtonXPathValue: str,
+) -> dict[str, Any]:
+    return evaluatePageWithNavigationRecovery(page,
+        r"""
+        ({ insufficientPackHeadingXPathValue, recoverPackButtonXPathValue }) => {
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const insufficientPackPatterns = [
+                /卡包不足/iu,
+                /pack\s*(?:unavailable|insufficient|depleted|empty|not\s+enough)/iu,
+                /(?:unavailable|insufficient|depleted|empty|not\s+enough)\s*pack/iu,
+                /パック.*不足|不足.*パック/iu,
+            ];
+            const recoveryPendingPatterns = [
+                /廣告(?:加載|載入|讀取|準備)中/iu,
+                /广告(?:加载|载入|读取|准备)中/iu,
+                /ad\s*(?:is\s*)?(?:loading|initializing|preparing)/iu,
+                /(?:loading|initializing|preparing)\s*ad/iu,
+                /請稍候|请稍候|請等待|请等待/iu,
+                /下次恢復|下次恢复|後可恢復|后可恢复/iu,
+                /\d+\s*秒後|\d+\s*秒后|\d+\s*s(?:ec(?:ond)?s?)?\s*(?:left|remaining)/iu,
+            ];
+            const recoveryActionPatterns = [
+                /觀看廣告恢復/iu,
+                /观看广告恢复/iu,
+                /廣告.*恢復|恢復.*廣告/iu,
+                /广告.*恢复|恢复.*广告/iu,
+                /watch.*ad.*(?:recover|restore|refill|reward)/iu,
+                /(?:recover|restore|refill|reward).*watch.*ad/iu,
+                /広告.*回復|回復.*広告/iu,
+            ];
+            const getClassText = (element) => typeof element.className === 'string' ? element.className : '';
+            const getElementText = (element) => {
+                if (!element) {
+                    return '';
+                }
+                return normalizeWhitespace([
+                    element.innerText,
+                    element.textContent,
+                    element.getAttribute ? element.getAttribute('aria-label') : '',
+                    element.getAttribute ? element.getAttribute('title') : '',
+                    element.getAttribute ? element.getAttribute('value') : '',
+                    element.id,
+                    getClassText(element),
+                    ...Array.from(element.querySelectorAll ? element.querySelectorAll('img[alt]') : [])
+                        .map((image) => image.getAttribute('alt')),
+                ].filter(Boolean).join(' '));
+            };
+            const isRendered = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0;
+            };
+            const isPointerReceivable = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                const rect = element.getBoundingClientRect();
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                const hitElement = document.elementFromPoint(centerX, centerY);
+                return Boolean(hitElement && (element === hitElement || element.contains(hitElement)));
+            };
+            const isActionable = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                    return false;
+                }
+                return isRendered(element)
+                    && !element.hasAttribute('disabled')
+                    && element.getAttribute('aria-disabled') !== 'true'
+                    && window.getComputedStyle(element).pointerEvents !== 'none'
+                    && isPointerReceivable(element);
+            };
+            const resolveXPathElement = (xpath) => {
+                if (!xpath) {
+                    return null;
+                }
+                try {
+                    return document.evaluate(
+                        xpath,
+                        document,
+                        null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE,
+                        null,
+                    ).singleNodeValue;
+                } catch (error) {
+                    return null;
+                }
+            };
+            const getEvidenceCount = (patterns, text) => patterns
+                .map((pattern) => pattern.test(text))
+                .filter(Boolean)
+                .length;
+            const summarizeElement = (element, source) => {
+                if (!(element instanceof HTMLElement)) {
+                    return null;
+                }
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+                const text = getElementText(element);
+                return {
+                    source,
+                    text: text.slice(0, 260),
+                    tagName: element.tagName.toLowerCase(),
+                    role: element.getAttribute('role') || '',
+                    id: element.id || '',
+                    className: getClassText(element).slice(0, 260),
+                    rendered: isRendered(element),
+                    actionable: isActionable(element),
+                    disabled: element.hasAttribute('disabled'),
+                    ariaDisabled: element.getAttribute('aria-disabled') || '',
+                    pointerEvents: style.pointerEvents,
+                    cursor: style.cursor,
+                    pendingEvidence: getEvidenceCount(recoveryPendingPatterns, text),
+                    recoveryEvidence: getEvidenceCount(recoveryActionPatterns, text),
+                    rect: {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                };
+            };
+
+            const configuredHeading = resolveXPathElement(insufficientPackHeadingXPathValue);
+            const headingCandidates = [
+                configuredHeading,
+                ...Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]')),
+            ]
+                .filter((element) => element instanceof HTMLElement)
+                .filter(isRendered)
+                .filter((element, index, allElements) => index === allElements.findIndex((other) => other === element))
+                .filter((element) => getEvidenceCount(insufficientPackPatterns, getElementText(element)) > 0);
+
+            if (headingCandidates.length === 0) {
+                return {
+                    ok: false,
+                    reason: 'No visible insufficient-pack heading was detected while probing pending recovery state.',
+                    insufficientPackHeadingXPath: insufficientPackHeadingXPathValue,
+                    visibleTextSample: document.body ? document.body.innerText.slice(0, 1600) : '',
+                };
+            }
+
+            const selectedHeading = headingCandidates[0];
+            const configuredButton = resolveXPathElement(recoverPackButtonXPathValue);
+            const actionableSelector = [
+                'button',
+                'a[href]',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]'
+            ].join(',');
+            const bodyText = document.body ? getElementText(document.body) : '';
+            const rawActionSummaries = [
+                configuredButton instanceof HTMLElement ? summarizeElement(configuredButton, 'configuredRecoverPackButtonXPath') : null,
+                ...Array.from(document.querySelectorAll(actionableSelector))
+                    .filter((element) => element instanceof HTMLElement)
+                    .filter(isRendered)
+                    .map((element) => summarizeElement(element, 'semanticAction')),
+            ].filter(Boolean);
+            const actionSummaries = rawActionSummaries.filter((summary, index, summaries) => {
+                return index === summaries.findIndex((other) => {
+                    return other.text === summary.text
+                        && other.tagName === summary.tagName
+                        && other.id === summary.id
+                        && other.className === summary.className;
+                });
+            });
+
+            const pendingActionSummaries = actionSummaries.filter((summary) => {
+                return summary.pendingEvidence > 0 || (summary.recoveryEvidence === 0 && /廣告|广告|ad/iu.test(summary.text));
+            });
+            const pagePendingEvidence = getEvidenceCount(recoveryPendingPatterns, bodyText);
+            if (pendingActionSummaries.length === 0 && pagePendingEvidence === 0) {
+                return {
+                    ok: false,
+                    reason: 'Insufficient-pack state was detected, but no ad-loading or recovery countdown state was detected.',
+                    headingText: getElementText(selectedHeading).slice(0, 260),
+                    actionSummaries,
+                    visibleTextSample: bodyText.slice(0, 1600),
+                };
+            }
+
+            return {
+                ok: true,
+                reason: 'Insufficient-pack ad recovery is pending; the automation should wait for a real recovery button, ad-close target, reward-confirmation target, or pack-ready state.',
+                headingText: getElementText(selectedHeading).slice(0, 260),
+                pagePendingEvidence,
+                pendingActionSummaries,
+                actionSummaries,
+                visibleTextSample: bodyText.slice(0, 1600),
+            };
+        }
+        """,
+        {
+            "insufficientPackHeadingXPathValue": insufficientPackHeadingXPathValue,
+            "recoverPackButtonXPathValue": recoverPackButtonXPathValue,
+        },
+    )
+
+
 def resolveAdRewardConfirmationSelector(page: Page, adRewardConfirmButtonXPathValue: str) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         (adRewardConfirmButtonXPathValue) => {
             const markerPrefix = `auto-wikigacha-ad-confirm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -2550,7 +2907,7 @@ def waitForAdRewardConfirmationTarget(page: Page, adRewardConfirmButtonXPathValu
 
 
 def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValue: str) -> dict[str, Any]:
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         (adOverlayCloseButtonXPathValue) => {
             const markerPrefix = `auto-wikigacha-ad-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -2838,7 +3195,7 @@ def resolveAdInterruptionCloseSelector(page: Page, adOverlayCloseButtonXPathValu
 
 def resolveAdCloseConfirmationTargetInFrame(frame: Any, frameIndex: int) -> dict[str, Any]:
     try:
-        frameResolution = frame.evaluate(
+        frameResolution = evaluateFrameWithNavigationRecovery(frame,
             r"""
             ({ frameIndex, frameName, frameUrl }) => {
                 const markerPrefix = `auto-wikigacha-frame-ad-close-confirmation-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -3145,7 +3502,7 @@ def resolveAdCloseConfirmationTarget(page: Page) -> dict[str, Any]:
 
 def resolveAdCloseSelectorInFrame(frame: Any, frameIndex: int) -> dict[str, Any]:
     try:
-        frameResolution = frame.evaluate(
+        frameResolution = evaluateFrameWithNavigationRecovery(frame,
             r"""
             ({ frameIndex, frameName, frameUrl }) => {
                 const markerPrefix = `auto-wikigacha-frame-ad-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -3430,7 +3787,7 @@ def clickSelectorUsingFreshFrameElement(page: Page, resolution: dict[str, Any]) 
             "selector": selector,
         }
     try:
-        return frame.evaluate(
+        return evaluateFrameWithNavigationRecovery(frame,
             r"""
             (selector) => new Promise((resolve) => {
                 const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -3635,7 +3992,7 @@ def clickResolvedAdCloseTargetAndWait(
 
 
 def waitForAdOutcomeMutationOrPaint(page: Page) -> None:
-    page.evaluate(
+    evaluatePageWithNavigationRecovery(page,
         r"""
         () => new Promise((resolve) => {
             let resolved = false;
@@ -3714,7 +4071,7 @@ def waitForGoogleRewardedAdCloseSettlingWindow(page: Page, settlingSeconds: floa
             "requestedSettlingSeconds": settlingSeconds,
         }
 
-    return page.evaluate(
+    return evaluatePageWithNavigationRecovery(page,
         r"""
         ({ settlingSeconds, settlingPhase }) => new Promise((resolve) => {
             const requestedSettlingSeconds = Number(settlingSeconds);
@@ -4157,6 +4514,35 @@ def recoverFromExpectedAdRecoveryOutcome(
         "a reward-confirmation control could be resolved. Inspect the outcome evidence."
     )
 
+
+def waitForPendingInsufficientPackRecoveryOutcome(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    pendingRecoveryState: dict[str, Any],
+) -> bool:
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_insufficient_pack_recovery_pending",
+        pendingRecoveryState,
+    )
+    print(
+        "[INFO] Insufficient-pack recovery is still loading; waiting for the recovery button, "
+        "ad-close target, reward confirmation, or pack-ready state."
+    )
+    return recoverFromExpectedAdRecoveryOutcome(
+        page,
+        evidencePath,
+        arguments,
+        drawIndex,
+        reason=(
+            "The page is in an insufficient-pack ad-loading state, so pack/card target resolution must wait "
+            "until the recovery control becomes actionable or an ad-recovery outcome appears."
+        ),
+    )
+
 def completePackOpening(
     page: Page,
     arguments: argparse.Namespace,
@@ -4228,6 +4614,25 @@ def completePackOpening(
         )
         targetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
         if not targetResolution.get("ok"):
+            pendingInsufficientPackRecoveryState = resolveInsufficientPackPendingRecoveryState(
+                page,
+                arguments.insufficientPackHeadingXPath,
+                arguments.recoverPackButtonXPath,
+            )
+            if pendingInsufficientPackRecoveryState.get("ok"):
+                if waitForPendingInsufficientPackRecoveryOutcome(
+                    page,
+                    evidencePath,
+                    arguments,
+                    drawIndex,
+                    pendingInsufficientPackRecoveryState,
+                ):
+                    if arguments.dryRun:
+                        return True
+                    seenOpeningStateHashes.clear()
+                    waitForRenderCycle(page)
+                    continue
+
             recoveredGates = recoverFromPossibleEntryGate(
                 page,
                 evidencePath,
@@ -4272,6 +4677,25 @@ def completePackOpening(
                     if arguments.dryRun:
                         return True
                     shouldWaitForDeferredAdOutcome = False
+                    seenOpeningStateHashes.clear()
+                    waitForRenderCycle(page)
+                    continue
+
+            pendingInsufficientPackRecoveryState = resolveInsufficientPackPendingRecoveryState(
+                page,
+                arguments.insufficientPackHeadingXPath,
+                arguments.recoverPackButtonXPath,
+            )
+            if pendingInsufficientPackRecoveryState.get("ok"):
+                if waitForPendingInsufficientPackRecoveryOutcome(
+                    page,
+                    evidencePath,
+                    arguments,
+                    drawIndex,
+                    pendingInsufficientPackRecoveryState,
+                ):
+                    if arguments.dryRun:
+                        return True
                     seenOpeningStateHashes.clear()
                     waitForRenderCycle(page)
                     continue
