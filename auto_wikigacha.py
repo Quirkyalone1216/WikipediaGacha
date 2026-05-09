@@ -1132,11 +1132,14 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                 /return\s+to\s+pack|back\s+to\s+pack|pack\s+page/iu,
                 /パック.*戻|戻.*パック/iu
             ];
-            const resultUtilityPatterns = [
+            const resultPageEvidencePatterns = [
                 /複製結果|复制结果|分享結果|分享结果/iu,
                 /copy\s+result|share\s+result/iu,
                 /左右滑動|左右滑动|使用\s*<>\s*翻頁|使用\s*<>\s*翻页/iu,
-                /內容遵循|内容遵循|Wikipedia 作者所有|ATK|DEF/iu,
+                /內容遵循|内容遵循|Wikipedia 作者所有|ATK|DEF/iu
+            ];
+            const resultUtilityPatterns = [
+                ...resultPageEvidencePatterns,
                 /分享|share|シェア|複製|复制|copy/iu,
                 /結果|结果|result/iu
             ];
@@ -1244,7 +1247,7 @@ def resolveDrawTargetSelector(page: Page, returnButtonXPath: str) -> dict[str, A
                 && (element === configuredReturnButton || configuredReturnButton.contains(element));
             const visibleBodyText = document.body ? getNormalizedText(document.body) : '';
             const pageResultEvidence = getEvidenceCount(returnPatterns, visibleBodyText)
-                + getEvidenceCount(resultUtilityPatterns, visibleBodyText);
+                + getEvidenceCount(resultPageEvidencePatterns, visibleBodyText);
 
             const allCandidates = Array.from(document.querySelectorAll(candidateSelector))
                 .filter((element) => element instanceof HTMLElement)
@@ -2065,11 +2068,10 @@ def hasRemainingPacks(remainingPackResolution: dict[str, Any]) -> bool | None:
 def isResultPageTargetSuppression(targetResolution: dict[str, Any]) -> bool:
     if targetResolution.get("ok"):
         return False
-    pageResultEvidence = targetResolution.get("pageResultEvidence")
-    if isinstance(pageResultEvidence, int) and pageResultEvidence > 0:
-        return True
     reason = str(targetResolution.get("reason", ""))
-    return "Result-page controls were detected" in reason
+    if "Result-page controls were detected" in reason:
+        return True
+    return False
 
 
 def resolveReturnToPackPageSelector(page: Page, returnButtonXPath: str) -> dict[str, Any]:
@@ -4511,16 +4513,6 @@ def resolvePackReadyAfterAdRecoveryOutcome(
             "returnResolution": returnResolution,
         }
 
-    drawTargetResolution = resolveDrawTargetSelector(page, returnButtonXPath)
-    if drawTargetResolution.get("ok"):
-        return {
-            "ok": True,
-            "outcomeType": "packTargetBecameAvailable",
-            "remainingPackResolution": remainingPackResolution,
-            "returnResolution": returnResolution,
-            "drawTargetResolution": drawTargetResolution,
-        }
-
     insufficientPackRecoveryResolution = resolveInsufficientPackRecoverySelector(
         page,
         insufficientPackHeadingXPathValue,
@@ -4532,8 +4524,52 @@ def resolvePackReadyAfterAdRecoveryOutcome(
             "outcomeType": "insufficientPackRecoveryStillAvailable",
             "remainingPackResolution": remainingPackResolution,
             "returnResolution": returnResolution,
-            "drawTargetResolution": drawTargetResolution,
             "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+            "readinessBasis": "insufficientPackRecoveryButtonHasPriorityOverResultPageTextEvidence",
+        }
+
+    pendingInsufficientPackRecoveryState = resolveInsufficientPackPendingRecoveryState(
+        page,
+        insufficientPackHeadingXPathValue,
+        recoverPackButtonXPathValue,
+    )
+    if pendingInsufficientPackRecoveryState.get("ok"):
+        return {
+            "ok": False,
+            "reason": (
+                "The page is still in an insufficient-pack ad-loading state. Result-page suppression evidence "
+                "must not trigger route recovery until the recovery button, ad-close target, reward confirmation, "
+                "or a true pack-ready state appears."
+            ),
+            "remainingPackResolution": remainingPackResolution,
+            "returnResolution": returnResolution,
+            "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+            "pendingInsufficientPackRecoveryState": pendingInsufficientPackRecoveryState,
+            "pendingRecoveryStateDetected": True,
+        }
+
+    drawTargetResolution = resolveDrawTargetSelector(page, returnButtonXPath)
+    if drawTargetResolution.get("ok"):
+        return {
+            "ok": True,
+            "outcomeType": "packTargetBecameAvailable",
+            "remainingPackResolution": remainingPackResolution,
+            "returnResolution": returnResolution,
+            "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+            "pendingInsufficientPackRecoveryState": pendingInsufficientPackRecoveryState,
+            "drawTargetResolution": drawTargetResolution,
+        }
+
+    if isResultPageTargetSuppression(drawTargetResolution):
+        return {
+            "ok": True,
+            "outcomeType": "resultPageReturnRouteRecoveryRequired",
+            "remainingPackResolution": remainingPackResolution,
+            "returnResolution": returnResolution,
+            "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+            "pendingInsufficientPackRecoveryState": pendingInsufficientPackRecoveryState,
+            "drawTargetResolution": drawTargetResolution,
+            "readinessBasis": "resultPageSuppressionMustBeRecoveredOnlyAfterInsufficientPackPendingStateWasExcluded",
         }
 
     remainingPackCount = getRemainingPackCountValue(remainingPackResolution)
@@ -4544,18 +4580,23 @@ def resolvePackReadyAfterAdRecoveryOutcome(
             "outcomeType": "remainingPackCountBecamePositive",
             "remainingPackResolution": remainingPackResolution,
             "returnResolution": returnResolution,
+            "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+            "pendingInsufficientPackRecoveryState": pendingInsufficientPackRecoveryState,
             "drawTargetResolution": drawTargetResolution,
-            "readinessBasis": "remainingPackCounterOnlyAfterResultPageSuppressionWasExcluded",
+            "readinessBasis": "remainingPackCounterOnlyAfterResultPageSuppressionAndInsufficientPackPendingStateWereExcluded",
         }
 
     return {
         "ok": False,
         "reason": (
             "No post-ad actionable pack-ready state was resolved yet. The remaining-pack counter alone is not "
-            "treated as proof of pack-page readiness when result-page controls are still detected."
+            "treated as proof of pack-page readiness when result-page controls are still detected, and an "
+            "insufficient-pack pending state must keep the adaptive wait active instead of triggering route recovery."
         ),
         "remainingPackResolution": remainingPackResolution,
         "returnResolution": returnResolution,
+        "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+        "pendingInsufficientPackRecoveryState": pendingInsufficientPackRecoveryState,
         "drawTargetResolution": drawTargetResolution,
         "remainingCountIsPositive": remainingCountIsPositive,
         "resultPageSuppressionDetected": isResultPageTargetSuppression(drawTargetResolution),
@@ -4766,6 +4807,245 @@ def clickReturnToPackPageOutcomeIfPresent(
     return True
 
 
+
+
+def buildPackPageRouteRecoveryUrl(page: Page, targetUrl: str) -> str:
+    candidateUrl = str(targetUrl or page.url or wikiGachaUrl)
+    try:
+        parsedUrl = urlsplit(candidateUrl)
+    except ValueError:
+        parsedUrl = urlsplit(wikiGachaUrl)
+    if not parsedUrl.scheme or not parsedUrl.netloc:
+        parsedUrl = urlsplit(wikiGachaUrl)
+    return parsedUrl._replace(fragment="").geturl()
+
+
+def navigateToPackPageRoute(page: Page, recoveryUrl: str) -> dict[str, Any]:
+    previousUrl = page.url
+    previousFingerprint = getPageStateFingerprint(page)
+    navigationStartedAtMonotonicSeconds = time.monotonic()
+    navigationEvents: list[dict[str, Any]] = []
+
+    try:
+        page.goto(recoveryUrl, wait_until="domcontentloaded", timeout=0)
+        navigationEvents.append({"action": "gotoPackPageRoute", "ok": True})
+    except PlaywrightError as navigationError:
+        if isBrowserLifecycleClosedError(navigationError):
+            raise
+        navigationEvents.append(
+            {
+                "action": "gotoPackPageRoute",
+                "ok": False,
+                "errorType": type(navigationError).__name__,
+                "errorMessage": str(navigationError),
+            }
+        )
+        if not isNavigationInterruptedEvaluationError(navigationError):
+            raise
+
+    try:
+        waitForPageReady(page)
+    except PlaywrightError as readinessError:
+        if isBrowserLifecycleClosedError(readinessError):
+            raise
+        navigationEvents.append(
+            {
+                "action": "waitForPageReadyAfterGoto",
+                "ok": False,
+                "errorType": type(readinessError).__name__,
+                "errorMessage": str(readinessError),
+            }
+        )
+        if not isNavigationInterruptedEvaluationError(readinessError):
+            raise
+        waitForEvaluationContextRecovery(page, "packPageRouteGotoReadinessInterrupted")
+
+    currentBaseUrl = page.url.split("#", 1)[0]
+    targetBaseUrl = recoveryUrl.split("#", 1)[0]
+    if currentBaseUrl == targetBaseUrl:
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=0)
+            navigationEvents.append({"action": "reloadPackPageRoute", "ok": True})
+            waitForPageReady(page)
+        except PlaywrightError as reloadError:
+            if isBrowserLifecycleClosedError(reloadError):
+                raise
+            navigationEvents.append(
+                {
+                    "action": "reloadPackPageRoute",
+                    "ok": False,
+                    "errorType": type(reloadError).__name__,
+                    "errorMessage": str(reloadError),
+                }
+            )
+            if not isNavigationInterruptedEvaluationError(reloadError):
+                raise
+            waitForEvaluationContextRecovery(page, "packPageRouteReloadInterrupted")
+
+    waitForRenderCycle(page)
+    currentFingerprint = getPageStateFingerprint(page)
+    return {
+        "previousUrl": previousUrl,
+        "recoveryUrl": recoveryUrl,
+        "currentUrl": page.url,
+        "navigationEvents": navigationEvents,
+        "elapsedRecoverySeconds": time.monotonic() - navigationStartedAtMonotonicSeconds,
+        "previousFingerprintHash": buildShortHash(previousFingerprint),
+        "currentFingerprintHash": buildShortHash(currentFingerprint),
+        "stateChanged": previousFingerprint != currentFingerprint,
+    }
+
+
+def buildPackPageRouteRecoveryAssessment(page: Page, arguments: argparse.Namespace) -> dict[str, Any]:
+    drawTargetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
+    returnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
+    remainingPackResolution = resolveRemainingPackCount(
+        page,
+        arguments.remainingPackCountXPath,
+        arguments.insufficientPackHeadingXPath,
+    )
+    insufficientPackRecoveryResolution = resolveInsufficientPackRecoverySelector(
+        page,
+        arguments.insufficientPackHeadingXPath,
+        arguments.recoverPackButtonXPath,
+    )
+    pendingInsufficientPackRecoveryState = resolveInsufficientPackPendingRecoveryState(
+        page,
+        arguments.insufficientPackHeadingXPath,
+        arguments.recoverPackButtonXPath,
+    )
+    adInterruptionResolution = resolveAdInterruptionCloseTarget(page, arguments.adOverlayCloseButtonXPath)
+    adRewardConfirmationResolution = resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath)
+    resultPageSuppressionPresent = isResultPageTargetSuppression(drawTargetResolution)
+    remainingPackCount = getRemainingPackCountValue(remainingPackResolution)
+    remainingPackCountIsPositive = isinstance(remainingPackCount, int) and remainingPackCount > 0
+    routeRecoverySignals = {
+        "drawTargetAvailable": bool(drawTargetResolution.get("ok")),
+        "returnToPackPageAvailable": bool(returnResolution.get("ok")),
+        "insufficientPackRecoveryAvailable": bool(insufficientPackRecoveryResolution.get("ok")),
+        "insufficientPackRecoveryPending": bool(pendingInsufficientPackRecoveryState.get("ok")),
+        "adInterruptionCloseAvailable": bool(adInterruptionResolution.get("ok")),
+        "adRewardConfirmationAvailable": bool(adRewardConfirmationResolution.get("ok")),
+        "remainingPackCountPositiveWithoutResultPageSuppression": remainingPackCountIsPositive and not resultPageSuppressionPresent,
+        "resultPageSuppressionCleared": not resultPageSuppressionPresent,
+    }
+    actionableRecoverySignalAvailable = any(routeRecoverySignals.values())
+    return {
+        "drawTargetResolution": drawTargetResolution,
+        "returnResolution": returnResolution,
+        "remainingPackResolution": remainingPackResolution,
+        "remainingPackCount": remainingPackCount,
+        "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+        "pendingInsufficientPackRecoveryState": pendingInsufficientPackRecoveryState,
+        "adInterruptionResolution": adInterruptionResolution,
+        "adRewardConfirmationResolution": adRewardConfirmationResolution,
+        "resultPageSuppressionPresent": resultPageSuppressionPresent,
+        "routeRecoverySignals": routeRecoverySignals,
+        "actionableRecoverySignalAvailable": actionableRecoverySignalAvailable,
+        "packPageRouteRecovered": actionableRecoverySignalAvailable,
+        "browserLifecycleRestartRecommended": resultPageSuppressionPresent and not actionableRecoverySignalAvailable,
+    }
+
+def recoverFromResultPageSuppressionWithoutReturnTarget(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    targetResolution: dict[str, Any],
+    returnResolution: dict[str, Any],
+    evidenceLabelPrefix: str,
+) -> bool:
+    if not isResultPageTargetSuppression(targetResolution):
+        return False
+
+    refreshedReturnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
+    if refreshedReturnResolution.get("ok"):
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_late_return_to_pack_target",
+            {
+                "targetResolution": targetResolution,
+                "initialReturnResolution": returnResolution,
+                "refreshedReturnResolution": refreshedReturnResolution,
+            },
+        )
+        if arguments.dryRun:
+            print("[DRY-RUN] Late return-to-pack-page target resolved; route recovery skipped.")
+            return True
+        returnPayload = {
+            "targetResolutionBeforeReturn": targetResolution,
+            "initialReturnResolution": returnResolution,
+            "returnResolution": refreshedReturnResolution,
+            **clickResolvedSelectorAndWait(
+                page,
+                refreshedReturnResolution["selector"],
+                lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+                returnOnRefreshResolutionFailure=True,
+            ),
+        }
+        saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_late_returned_to_pack_page", returnPayload)
+        if returnPayload.get("stateChanged"):
+            resetAdaptiveAdInterruptionRecoveryState("lateResultPageReturnTargetRecovered")
+            print("[INFO] Result-page controls were detected; a late return-to-pack control was clicked before resuming.")
+            return True
+
+    recoveryUrl = buildPackPageRouteRecoveryUrl(page, arguments.url)
+    recoveryStartPayload = {
+        "reason": (
+            "Result-page controls were detected, but no actionable return-to-pack control was available. "
+            "Recovering by re-entering the canonical pack-page route instead of treating the result-page "
+            "suppression as a fatal pack-target failure."
+        ),
+        "targetResolution": targetResolution,
+        "initialReturnResolution": returnResolution,
+        "refreshedReturnResolution": refreshedReturnResolution,
+        "recoveryUrl": recoveryUrl,
+    }
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_route_recovery_started", recoveryStartPayload)
+    if arguments.dryRun:
+        print("[DRY-RUN] Result-page route recovery would navigate back to the pack page; navigation skipped.")
+        return True
+
+    navigationPayload = navigateToPackPageRoute(page, recoveryUrl)
+    recoveryAssessment = buildPackPageRouteRecoveryAssessment(page, arguments)
+    recoveryPayload = {
+        **recoveryStartPayload,
+        "navigationPayload": navigationPayload,
+        "recoveryAssessment": recoveryAssessment,
+    }
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_route_recovered", recoveryPayload)
+    if recoveryAssessment.get("packPageRouteRecovered"):
+        resetAdaptiveAdInterruptionRecoveryState("resultPageRouteRecoveredWithoutReturnTarget")
+        routeRecoverySignals = recoveryAssessment.get("routeRecoverySignals", {})
+        print(
+            "[INFO] Result-page controls were detected without a return target; "
+            "canonical route recovery exposed a safe recovery state before resuming. "
+            f"signals={routeRecoverySignals}"
+        )
+        return True
+
+    lifecycleRestartPayload = {
+        "reason": (
+            "Result-page controls remained rendered after canonical route recovery and no actionable return, pack, "
+            "insufficient-pack, ad-close, reward-confirmation, or pending recovery state was available. The current "
+            "browser context is treated as stale and will be restarted instead of turning the suppression guard into "
+            "a fatal automation error."
+        ),
+        "targetResolution": targetResolution,
+        "initialReturnResolution": returnResolution,
+        "refreshedReturnResolution": refreshedReturnResolution,
+        "navigationPayload": navigationPayload,
+        "recoveryAssessment": recoveryAssessment,
+    }
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_{evidenceLabelPrefix}_route_recovery_lifecycle_restart_requested",
+        lifecycleRestartPayload,
+    )
+    raise BrowserLifecycleRestartRequired(lifecycleRestartPayload["reason"])
+
 def isInsufficientPackRecoveryClickTransition(clickPayload: dict[str, Any]) -> bool:
     if clickPayload.get("clickCompleted"):
         return False
@@ -4973,6 +5253,18 @@ def recoverFromInsufficientPackIfPresent(
     ):
         return True
 
+    if adRecoveryOutcome.get("outcomeType") == "resultPageReturnRouteRecoveryRequired":
+        if recoverFromResultPageSuppressionWithoutReturnTarget(
+            page,
+            evidencePath,
+            arguments,
+            drawIndex,
+            adRecoveryOutcome.get("drawTargetResolution", {}),
+            adRecoveryOutcome.get("returnResolution", {}),
+            "ad_recovery_result_page_suppression",
+        ):
+            return True
+
     if adRecoveryOutcome.get("outcomeType") in {
         "remainingPackCountBecamePositive",
         "packTargetBecameAvailable",
@@ -5091,6 +5383,18 @@ def recoverFromExpectedAdRecoveryOutcome(
         "expected_deferred_ad_recovery_outcome",
     ):
         return True
+
+    if adRecoveryOutcome.get("outcomeType") == "resultPageReturnRouteRecoveryRequired":
+        if recoverFromResultPageSuppressionWithoutReturnTarget(
+            page,
+            evidencePath,
+            arguments,
+            drawIndex,
+            adRecoveryOutcome.get("drawTargetResolution", {}),
+            adRecoveryOutcome.get("returnResolution", {}),
+            "expected_deferred_result_page_suppression",
+        ):
+            return True
 
     if adRecoveryOutcome.get("outcomeType") in {
         "remainingPackCountBecamePositive",
@@ -5309,6 +5613,17 @@ def completePackOpening(
                     seenOpeningStateHashes.clear()
                     waitForRenderCycle(page)
                     continue
+
+            if hasClickedOpeningTarget and recoverFromResultPageSuppressionWithoutReturnTarget(
+                page,
+                evidencePath,
+                arguments,
+                drawIndex,
+                targetResolution,
+                returnResolution,
+                f"opening_{openingStepIndex:03d}_target_suppressed",
+            ):
+                return True
 
             refreshedReturnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
             if refreshedReturnResolution.get("ok"):
