@@ -5046,6 +5046,176 @@ def recoverFromResultPageSuppressionWithoutReturnTarget(
     )
     raise BrowserLifecycleRestartRequired(lifecycleRestartPayload["reason"])
 
+
+def classifyNoProgressRouteRecoveryOutcome(
+    recoveryAssessment: dict[str, Any],
+    hadObservedOpeningProgress: bool,
+    refreshedTargetResolution: dict[str, Any],
+) -> str:
+    if hadObservedOpeningProgress or isResultPageTargetSuppression(refreshedTargetResolution):
+        return "opened"
+
+    returnResolution = recoveryAssessment.get("returnResolution")
+    if isinstance(returnResolution, dict) and returnResolution.get("ok"):
+        return "opened"
+
+    drawTargetResolution = recoveryAssessment.get("drawTargetResolution")
+    if isinstance(drawTargetResolution, dict) and drawTargetResolution.get("ok"):
+        return "continue"
+
+    insufficientPackRecoveryResolution = recoveryAssessment.get("insufficientPackRecoveryResolution")
+    if isinstance(insufficientPackRecoveryResolution, dict) and insufficientPackRecoveryResolution.get("ok"):
+        return "continue"
+
+    pendingInsufficientPackRecoveryState = recoveryAssessment.get("pendingInsufficientPackRecoveryState")
+    if isinstance(pendingInsufficientPackRecoveryState, dict) and pendingInsufficientPackRecoveryState.get("ok"):
+        return "continue"
+
+    adInterruptionResolution = recoveryAssessment.get("adInterruptionResolution")
+    if isinstance(adInterruptionResolution, dict) and adInterruptionResolution.get("ok"):
+        return "continue"
+
+    adRewardConfirmationResolution = recoveryAssessment.get("adRewardConfirmationResolution")
+    if isinstance(adRewardConfirmationResolution, dict) and adRewardConfirmationResolution.get("ok"):
+        return "continue"
+
+    return "continue"
+
+
+def recoverFromNoProgressContinuationTarget(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    openingStepIndex: int,
+    progressPayload: dict[str, Any],
+    hadObservedOpeningProgress: bool,
+) -> str:
+    returnResolutionAfterNoChange = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
+    progressPayload["returnResolutionAfterNoChange"] = returnResolutionAfterNoChange
+    if returnResolutionAfterNoChange.get("ok"):
+        recoveryEvidenceLabel = "aborted_target_return_recovered" if progressPayload.get("clickAborted") else "no_change_return_recovered"
+        saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_{recoveryEvidenceLabel}", progressPayload)
+        if arguments.dryRun:
+            return "opened"
+        returnPayload = {
+            "returnResolution": returnResolutionAfterNoChange,
+            "noChangeTargetPayload": progressPayload,
+            **clickResolvedSelectorAndWait(
+                page,
+                returnResolutionAfterNoChange["selector"],
+                lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+                returnOnRefreshResolutionFailure=True,
+            ),
+        }
+        if returnPayload.get("stateChanged"):
+            resetAdaptiveAdInterruptionRecoveryState("returnedToPackPageAfterNoProgressTarget")
+            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
+            return "opened"
+
+        returnPayload["refreshedReturnResolution"] = resolveReturnToPackPageSelector(
+            page,
+            arguments.returnToPackPageXPath,
+        )
+        returnPayload["refreshedDrawTargetResolution"] = resolveDrawTargetSelector(
+            page,
+            arguments.returnToPackPageXPath,
+        )
+        saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_return_after_no_change_target_no_change", returnPayload)
+        if returnPayload["refreshedDrawTargetResolution"].get("ok"):
+            progressPayload["postReturnNoChangeRecovery"] = returnPayload
+            resetAdaptiveAdInterruptionRecoveryState("returnNoProgressAlreadyExposedPackTarget")
+            print("[INFO] Return target produced no state change, but a fresh pack target is available; resynchronizing.")
+            return "continue"
+
+        progressPayload["postReturnNoChangeRecovery"] = returnPayload
+
+    refreshedTargetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
+    progressPayload["refreshedTargetResolutionAfterNoChange"] = refreshedTargetResolution
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_no_change_after_click", progressPayload)
+
+    if isResultPageTargetSuppression(refreshedTargetResolution):
+        if recoverFromResultPageSuppressionWithoutReturnTarget(
+            page,
+            evidencePath,
+            arguments,
+            drawIndex,
+            refreshedTargetResolution,
+            returnResolutionAfterNoChange,
+            f"opening_{openingStepIndex:03d}_no_progress_result_page_suppressed",
+        ):
+            return "opened"
+
+    if refreshedTargetResolution.get("ok"):
+        resetAdaptiveAdInterruptionRecoveryState("noProgressTargetRefreshResolvedFreshTarget")
+        print("[INFO] Continuation target made no progress, but a fresh pack/card target was resolved; resynchronizing.")
+        return "continue"
+
+    recoveryUrl = buildPackPageRouteRecoveryUrl(page, arguments.url)
+    routeRecoveryStartPayload = {
+        "reason": (
+            "A continuation target produced no DOM or rendered-state progress and no return-to-pack target was "
+            "available. The script will re-enter the canonical pack-page route and resume from the first "
+            "actionable page signal instead of failing on the stale target."
+        ),
+        "progressPayload": progressPayload,
+        "refreshedTargetResolution": refreshedTargetResolution,
+        "returnResolutionAfterNoChange": returnResolutionAfterNoChange,
+        "hadObservedOpeningProgress": hadObservedOpeningProgress,
+        "recoveryUrl": recoveryUrl,
+    }
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_no_progress_route_recovery_started",
+        routeRecoveryStartPayload,
+    )
+    if arguments.dryRun:
+        return "opened" if hadObservedOpeningProgress else "continue"
+
+    navigationPayload = navigateToPackPageRoute(page, recoveryUrl)
+    recoveryAssessment = buildPackPageRouteRecoveryAssessment(page, arguments)
+    routeRecoveryPayload = {
+        **routeRecoveryStartPayload,
+        "navigationPayload": navigationPayload,
+        "recoveryAssessment": recoveryAssessment,
+    }
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_no_progress_route_recovered",
+        routeRecoveryPayload,
+    )
+    if recoveryAssessment.get("packPageRouteRecovered"):
+        recoveryOutcome = classifyNoProgressRouteRecoveryOutcome(
+            recoveryAssessment,
+            hadObservedOpeningProgress,
+            refreshedTargetResolution,
+        )
+        resetAdaptiveAdInterruptionRecoveryState("noProgressContinuationRouteRecovered")
+        print(
+            "[INFO] Continuation target produced no progress; canonical route recovery exposed "
+            f"a safe state before resuming. outcome={recoveryOutcome} "
+            f"signals={recoveryAssessment.get('routeRecoverySignals', {})}"
+        )
+        return recoveryOutcome
+
+    lifecycleRestartPayload = {
+        "reason": (
+            "A no-progress continuation target left no return, fresh pack target, insufficient-pack recovery, "
+            "ad-close, reward-confirmation, or pending recovery state after canonical route recovery. The current "
+            "browser lifecycle is stale and will be restarted instead of raising the original fatal error."
+        ),
+        "routeRecoveryPayload": routeRecoveryPayload,
+    }
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_no_progress_lifecycle_restart_requested",
+        lifecycleRestartPayload,
+    )
+    raise BrowserLifecycleRestartRequired(lifecycleRestartPayload["reason"])
+
 def isInsufficientPackRecoveryClickTransition(clickPayload: dict[str, Any]) -> bool:
     if clickPayload.get("clickCompleted"):
         return False
@@ -5469,6 +5639,7 @@ def completePackOpening(
     seenOpeningStateHashes: set[str] = set()
     openingStepIndex = 0
     hasClickedOpeningTarget = False
+    hasObservedOpeningProgress = False
     shouldWaitForDeferredAdOutcome = expectDeferredAdRecoveryOutcome
 
     while True:
@@ -5692,39 +5863,21 @@ def completePackOpening(
         }
         hasClickedOpeningTarget = True
         if not progressPayload.get("stateChanged"):
-            returnResolutionAfterNoChange = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
-            progressPayload["returnResolutionAfterNoChange"] = returnResolutionAfterNoChange
-            if returnResolutionAfterNoChange.get("ok"):
-                recoveryEvidenceLabel = "aborted_target_return_recovered" if progressPayload.get("clickAborted") else "no_change_return_recovered"
-                saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_{recoveryEvidenceLabel}", progressPayload)
-                returnPayload = {
-                    "returnResolution": returnResolutionAfterNoChange,
-                    "noChangeTargetPayload": progressPayload,
-                    **clickResolvedSelectorAndWait(
-                        page,
-                        returnResolutionAfterNoChange["selector"],
-                        lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
-                    ),
-                }
-                if not returnPayload.get("stateChanged"):
-                    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_return_after_no_change_target_no_change", returnPayload)
-                    raise WikiGachaAutomationError(
-                        "A stale or already-consumed continuation target produced no state change; "
-                        "a return-to-pack button was found, but clicking it also produced no state change."
-                    )
-                resetAdaptiveAdInterruptionRecoveryState("returnedToPackPage")
-                saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_returned_to_pack_page", returnPayload)
-                return True
-
-            refreshedTargetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
-            progressPayload["refreshedTargetResolutionAfterNoChange"] = refreshedTargetResolution
-            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_no_change_after_click", progressPayload)
-            raise WikiGachaAutomationError(
-                "Pack/card continuation target could not make progress. "
-                "The most likely upstream cause is that the originally resolved target became stale and the fresh resolver either suppressed "
-                "result-page controls or found no unrevealed pack target. Inspect clickAttempts, refreshResolutionFailure, "
-                "refreshedTargetResolutionAfterNoChange, and returnResolutionAfterNoChange evidence."
+            noProgressRecoveryOutcome = recoverFromNoProgressContinuationTarget(
+                page,
+                evidencePath,
+                arguments,
+                drawIndex,
+                openingStepIndex,
+                progressPayload,
+                hasObservedOpeningProgress,
             )
+            if noProgressRecoveryOutcome == "opened":
+                return True
+            seenOpeningStateHashes.clear()
+            waitForRenderCycle(page)
+            continue
+        hasObservedOpeningProgress = True
         resetAdaptiveAdInterruptionRecoveryState("packOpeningTargetAdvanced")
         saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_{openingStepIndex:03d}_result", progressPayload)
 
