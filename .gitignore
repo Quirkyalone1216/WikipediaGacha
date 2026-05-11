@@ -1,6 +1,7 @@
 .wikigacha-profile/
 wikigacha_results/
 .venvs/
+.venv/
 __pycache__/
 .vscode/
 
