@@ -465,18 +465,46 @@ def getPageFingerprint(page: Page) -> str:
     return evaluatePageWithNavigationRecovery(page,
         r"""
         () => {
+            const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const buildStableContentHash = (value) => {
+                const normalizedValue = String(value || '');
+                let firstHash = 0x811c9dc5;
+                let secondHash = 0x9e3779b9 ^ normalizedValue.length;
+                for (const character of normalizedValue) {
+                    const codePoint = character.codePointAt(0) || 0;
+                    firstHash ^= codePoint;
+                    firstHash = Math.imul(firstHash, 0x01000193) >>> 0;
+                    secondHash ^= codePoint + 0x9e3779b9 + ((secondHash << 6) >>> 0) + (secondHash >>> 2);
+                    secondHash = Math.imul(secondHash, 0x85ebca6b) >>> 0;
+                }
+                return `${firstHash.toString(16).padStart(8, '0')}${secondHash.toString(16).padStart(8, '0')}`;
+            };
+            const localStorageFingerprints = [];
             let localStorageValueLengthTotal = 0;
             for (let index = 0; index < localStorage.length; index += 1) {
-                const value = localStorage.getItem(localStorage.key(index)) || '';
+                const key = localStorage.key(index) || '';
+                const value = localStorage.getItem(key) || '';
                 localStorageValueLengthTotal += value.length;
+                localStorageFingerprints.push({
+                    keyHash: buildStableContentHash(key),
+                    valueHash: buildStableContentHash(value),
+                    valueLength: value.length,
+                });
             }
+            localStorageFingerprints.sort((left, right) => left.keyHash.localeCompare(right.keyHash));
+            const visibleText = document.body && document.body.innerText ? normalizeWhitespace(document.body.innerText) : '';
+            const bodyMarkup = document.body && document.body.innerHTML ? document.body.innerHTML : '';
             return JSON.stringify({
                 href: location.href,
+                titleHash: buildStableContentHash(document.title || ''),
                 titleLength: document.title ? document.title.length : 0,
-                visibleTextLength: document.body && document.body.innerText ? document.body.innerText.length : 0,
-                bodyMarkupLength: document.body && document.body.innerHTML ? document.body.innerHTML.length : 0,
+                visibleTextHash: buildStableContentHash(visibleText),
+                visibleTextLength: visibleText.length,
+                bodyMarkupHash: buildStableContentHash(bodyMarkup),
+                bodyMarkupLength: bodyMarkup.length,
                 localStorageEntryCount: localStorage.length,
                 localStorageValueLengthTotal,
+                localStorageFingerprints,
             });
         }
         """
@@ -488,6 +516,19 @@ def getRenderedStateFingerprint(page: Page) -> str:
         r"""
         () => {
             const normalizeWhitespace = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const buildStableContentHash = (value) => {
+                const normalizedValue = String(value || '');
+                let firstHash = 0x811c9dc5;
+                let secondHash = 0x9e3779b9 ^ normalizedValue.length;
+                for (const character of normalizedValue) {
+                    const codePoint = character.codePointAt(0) || 0;
+                    firstHash ^= codePoint;
+                    firstHash = Math.imul(firstHash, 0x01000193) >>> 0;
+                    secondHash ^= codePoint + 0x9e3779b9 + ((secondHash << 6) >>> 0) + (secondHash >>> 2);
+                    secondHash = Math.imul(secondHash, 0x85ebca6b) >>> 0;
+                }
+                return `${firstHash.toString(16).padStart(8, '0')}${secondHash.toString(16).padStart(8, '0')}`;
+            };
             const isRenderedElement = (element) => {
                 if (!(element instanceof HTMLElement)) {
                     return false;
@@ -504,12 +545,28 @@ def getRenderedStateFingerprint(page: Page) -> str:
                 const rect = element.getBoundingClientRect();
                 const renderedText = normalizeWhitespace(element.innerText || element.textContent || '');
                 const classText = typeof element.className === 'string' ? element.className : '';
+                const semanticAttributeText = [
+                    element.id || '',
+                    classText,
+                    element.getAttribute('role') || '',
+                    element.getAttribute('aria-label') || '',
+                    element.getAttribute('title') || '',
+                    element.getAttribute('value') || '',
+                    element.getAttribute('href') || '',
+                    element.getAttribute('src') || '',
+                    element.getAttribute('alt') || '',
+                    element.getAttribute('data-testid') || '',
+                ].join(' ');
                 return {
                     tagName: element.tagName.toLowerCase(),
+                    idHash: buildStableContentHash(element.id || ''),
                     idLength: element.id ? element.id.length : 0,
+                    classNameHash: buildStableContentHash(classText),
                     classNameLength: classText.length,
+                    semanticAttributeHash: buildStableContentHash(semanticAttributeText),
                     role: element.getAttribute('role') || '',
                     ariaHidden: element.getAttribute('aria-hidden') || '',
+                    textHash: buildStableContentHash(renderedText),
                     textLength: renderedText.length,
                     rect: {
                         left: rect.left,
@@ -528,16 +585,20 @@ def getRenderedStateFingerprint(page: Page) -> str:
                 };
             };
 
+            const renderedElements = Array.from(document.querySelectorAll('body *'))
+                .filter(isRenderedElement)
+                .map(summarizeElement);
             return JSON.stringify({
                 href: location.href,
+                titleHash: buildStableContentHash(document.title || ''),
                 titleLength: document.title ? document.title.length : 0,
+                bodyTextHash: buildStableContentHash(document.body ? normalizeWhitespace(document.body.innerText || '') : ''),
+                bodyMarkupHash: buildStableContentHash(document.body ? document.body.innerHTML || '' : ''),
                 scrollX: window.scrollX,
                 scrollY: window.scrollY,
                 viewportWidth: window.innerWidth,
                 viewportHeight: window.innerHeight,
-                renderedElements: Array.from(document.querySelectorAll('body *'))
-                    .filter(isRenderedElement)
-                    .map(summarizeElement),
+                renderedElements,
             });
         }
         """
@@ -5627,6 +5688,233 @@ def waitForPendingInsufficientPackRecoveryOutcome(
         ),
     )
 
+def recoverFromRepeatedOpeningState(
+    page: Page,
+    evidencePath: Path,
+    arguments: argparse.Namespace,
+    drawIndex: int,
+    openingStepIndex: int,
+    openingStateHash: str,
+    returnResolution: dict[str, Any],
+    hasClickedOpeningTarget: bool,
+    hasObservedOpeningProgress: bool,
+    allowNoInitialTarget: bool,
+    initialRemainingPackResolution: dict[str, Any],
+    shouldWaitForDeferredAdOutcome: bool,
+) -> str:
+    refreshedReturnResolution = resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath)
+    refreshedTargetResolution = resolveDrawTargetSelector(page, arguments.returnToPackPageXPath)
+    remainingPackResolution = resolveRemainingPackCount(
+        page,
+        arguments.remainingPackCountXPath,
+        arguments.insufficientPackHeadingXPath,
+    )
+    insufficientPackRecoveryResolution = resolveInsufficientPackRecoverySelector(
+        page,
+        arguments.insufficientPackHeadingXPath,
+        arguments.recoverPackButtonXPath,
+    )
+    pendingInsufficientPackRecoveryState = resolveInsufficientPackPendingRecoveryState(
+        page,
+        arguments.insufficientPackHeadingXPath,
+        arguments.recoverPackButtonXPath,
+    )
+    adInterruptionResolution = resolveAdInterruptionCloseTarget(page, arguments.adOverlayCloseButtonXPath)
+    adRewardConfirmationResolution = resolveAdRewardConfirmationSelector(page, arguments.adRewardConfirmButtonXPath)
+    repeatedStatePayload = {
+        "reason": (
+            "Opening flow reached a repeated rendered page state before the return-to-pack-page button appeared. "
+            "The state is now treated as an adaptive recovery boundary instead of a fatal terminal error."
+        ),
+        "openingStateHash": openingStateHash,
+        "openingStepIndex": openingStepIndex,
+        "initialReturnResolution": returnResolution,
+        "refreshedReturnResolution": refreshedReturnResolution,
+        "refreshedTargetResolution": refreshedTargetResolution,
+        "remainingPackResolution": remainingPackResolution,
+        "insufficientPackRecoveryResolution": insufficientPackRecoveryResolution,
+        "pendingInsufficientPackRecoveryState": pendingInsufficientPackRecoveryState,
+        "adInterruptionResolution": adInterruptionResolution,
+        "adRewardConfirmationResolution": adRewardConfirmationResolution,
+        "hasClickedOpeningTarget": hasClickedOpeningTarget,
+        "hasObservedOpeningProgress": hasObservedOpeningProgress,
+        "allowNoInitialTarget": allowNoInitialTarget,
+        "initialRemainingPackResolution": initialRemainingPackResolution,
+        "shouldWaitForDeferredAdOutcome": shouldWaitForDeferredAdOutcome,
+    }
+    saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_repeated_state", repeatedStatePayload)
+
+    if refreshedReturnResolution.get("ok"):
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_opening_repeated_state_return_to_pack_target",
+            repeatedStatePayload,
+        )
+        if arguments.dryRun:
+            print("[DRY-RUN] Repeated opening state exposed a return-to-pack target; return click skipped.")
+            return "opened"
+        returnPayload = {
+            "repeatedStatePayload": repeatedStatePayload,
+            "returnResolution": refreshedReturnResolution,
+            **clickResolvedSelectorAndWait(
+                page,
+                refreshedReturnResolution["selector"],
+                lambda: resolveReturnToPackPageSelector(page, arguments.returnToPackPageXPath),
+                returnOnRefreshResolutionFailure=True,
+            ),
+        }
+        saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_repeated_state_returned_to_pack_page", returnPayload)
+        if returnPayload.get("stateChanged"):
+            resetAdaptiveAdInterruptionRecoveryState("repeatedOpeningStateReturnedToPackPage")
+            print("[INFO] Repeated opening state exposed a return-to-pack target; returned to the pack page.")
+            return "opened"
+        returnPayload["refreshedTargetResolutionAfterReturnNoChange"] = resolveDrawTargetSelector(
+            page,
+            arguments.returnToPackPageXPath,
+        )
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_opening_repeated_state_return_no_change",
+            returnPayload,
+        )
+        if returnPayload["refreshedTargetResolutionAfterReturnNoChange"].get("ok"):
+            resetAdaptiveAdInterruptionRecoveryState("repeatedOpeningStateReturnNoChangeExposedPackTarget")
+            print("[INFO] Repeated opening-state return click produced no DOM change, but a fresh pack target is available.")
+            return "continue"
+
+    if isResultPageTargetSuppression(refreshedTargetResolution):
+        if recoverFromResultPageSuppressionWithoutReturnTarget(
+            page,
+            evidencePath,
+            arguments,
+            drawIndex,
+            refreshedTargetResolution,
+            refreshedReturnResolution,
+            "opening_repeated_state_result_page_suppressed",
+        ):
+            return "opened"
+
+    if insufficientPackRecoveryResolution.get("ok"):
+        resetAdaptiveAdInterruptionRecoveryState("repeatedOpeningStateExposedInsufficientPackRecovery")
+        print("[INFO] Repeated opening state exposed an insufficient-pack recovery target; resuming recovery flow.")
+        return "continue"
+
+    if pendingInsufficientPackRecoveryState.get("ok"):
+        if waitForPendingInsufficientPackRecoveryOutcome(
+            page,
+            evidencePath,
+            arguments,
+            drawIndex,
+            pendingInsufficientPackRecoveryState,
+        ):
+            return "continue"
+
+    if adInterruptionResolution.get("ok"):
+        if recoverFromAdInterruptionIfPresent(page, evidencePath, arguments, drawIndex):
+            return "continue"
+
+    if adRewardConfirmationResolution.get("ok"):
+        if clickAdRewardConfirmationIfPresent(
+            page,
+            evidencePath,
+            arguments,
+            drawIndex,
+            "opening_repeated_state",
+        ):
+            return "continue"
+
+    if shouldWaitForDeferredAdOutcome:
+        if recoverFromExpectedAdRecoveryOutcome(
+            page,
+            evidencePath,
+            arguments,
+            drawIndex,
+            reason=(
+                "A repeated opening state appeared while a deferred ad recovery outcome was still expected. "
+                "The automation must wait for a concrete ad-close, reward-confirmation, return-to-pack, "
+                "insufficient-pack, or pack-ready signal before deciding the lifecycle outcome."
+            ),
+        ):
+            return "continue"
+
+    if allowNoInitialTarget and not hasClickedOpeningTarget:
+        saveEvidence(
+            page,
+            evidencePath,
+            f"draw_{drawIndex:03d}_opening_repeated_state_completed_without_initial_target",
+            repeatedStatePayload,
+        )
+        print("[INFO] Repeated opening state appeared before any opening click; adaptive run is complete.")
+        return "complete"
+
+    if refreshedTargetResolution.get("ok") and not hasObservedOpeningProgress:
+        resetAdaptiveAdInterruptionRecoveryState("repeatedOpeningStateResolvedFreshInitialTarget")
+        print("[INFO] Repeated opening state still has a fresh initial pack target; resynchronizing before clicking.")
+        return "continue"
+
+    recoveryUrl = buildPackPageRouteRecoveryUrl(page, arguments.url)
+    routeRecoveryStartPayload = {
+        "reason": (
+            "A repeated opening state had no direct return, result-page, insufficient-pack, ad-close, "
+            "or reward-confirmation recovery signal. The script will re-enter the canonical pack-page route "
+            "and resume from the first actionable page signal instead of failing on the repeated-state sentinel."
+        ),
+        "repeatedStatePayload": repeatedStatePayload,
+        "recoveryUrl": recoveryUrl,
+    }
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_opening_repeated_state_route_recovery_started",
+        routeRecoveryStartPayload,
+    )
+    if arguments.dryRun:
+        return "opened" if hasObservedOpeningProgress else "continue"
+
+    navigationPayload = navigateToPackPageRoute(page, recoveryUrl)
+    recoveryAssessment = buildPackPageRouteRecoveryAssessment(page, arguments)
+    routeRecoveryPayload = {
+        **routeRecoveryStartPayload,
+        "navigationPayload": navigationPayload,
+        "recoveryAssessment": recoveryAssessment,
+    }
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_opening_repeated_state_route_recovered",
+        routeRecoveryPayload,
+    )
+    if recoveryAssessment.get("packPageRouteRecovered"):
+        recoveryOutcome = classifyNoProgressRouteRecoveryOutcome(
+            recoveryAssessment,
+            hasObservedOpeningProgress,
+            refreshedTargetResolution,
+        )
+        resetAdaptiveAdInterruptionRecoveryState("repeatedOpeningStateRouteRecovered")
+        print(
+            "[INFO] Repeated opening state was recovered through the canonical pack-page route. "
+            f"outcome={recoveryOutcome} signals={recoveryAssessment.get('routeRecoverySignals', {})}"
+        )
+        return recoveryOutcome
+
+    lifecycleRestartPayload = {
+        "reason": (
+            "A repeated opening state remained unrecoverable after canonical route recovery. The current browser "
+            "lifecycle is stale and will be restarted instead of surfacing the repeated-state sentinel as a fatal error."
+        ),
+        "routeRecoveryPayload": routeRecoveryPayload,
+    }
+    saveEvidence(
+        page,
+        evidencePath,
+        f"draw_{drawIndex:03d}_opening_repeated_state_lifecycle_restart_requested",
+        lifecycleRestartPayload,
+    )
+    raise BrowserLifecycleRestartRequired(lifecycleRestartPayload["reason"])
+
+
 def completePackOpening(
     page: Page,
     arguments: argparse.Namespace,
@@ -5683,13 +5971,27 @@ def completePackOpening(
 
         openingStateHash = buildShortHash(getPageStateFingerprint(page))
         if openingStateHash in seenOpeningStateHashes:
-            repeatPayload = {
-                "reason": "Opening flow reached a repeated rendered page state before the return-to-pack-page button appeared.",
-                "openingStateHash": openingStateHash,
-                "returnResolution": returnResolution,
-            }
-            saveEvidence(page, evidencePath, f"draw_{drawIndex:03d}_opening_repeated_state", repeatPayload)
-            raise WikiGachaAutomationError(repeatPayload["reason"])
+            repeatedStateOutcome = recoverFromRepeatedOpeningState(
+                page,
+                evidencePath,
+                arguments,
+                drawIndex,
+                openingStepIndex,
+                openingStateHash,
+                returnResolution,
+                hasClickedOpeningTarget,
+                hasObservedOpeningProgress,
+                allowNoInitialTarget,
+                initialRemainingPackResolution,
+                shouldWaitForDeferredAdOutcome,
+            )
+            if repeatedStateOutcome == "opened":
+                return True
+            if repeatedStateOutcome == "complete":
+                return False
+            seenOpeningStateHashes.clear()
+            waitForRenderCycle(page)
+            continue
         seenOpeningStateHashes.add(openingStateHash)
 
         openingStepIndex += 1
